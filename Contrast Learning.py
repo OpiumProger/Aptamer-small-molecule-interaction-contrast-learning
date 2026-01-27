@@ -243,8 +243,8 @@ if __name__ == '__main__':
             self.network = nn.Sequential(
                 nn.Linear(input_dim, 512),
                 nn.BatchNorm1d(512),
-                nn.GELU(),  # Или nn.SiLU()
-                nn.Dropout(0.2),  # Немного увеличиваем
+                nn.GELU(),
+                nn.Dropout(0.2),
                 nn.Linear(512, 256),
                 nn.BatchNorm1d(256),
                 nn.SiLU(),
@@ -266,10 +266,6 @@ if __name__ == '__main__':
             z_seq = self.sequence_proj(sequence_emb)
             z_smi = self.smiles_proj(smiles_emb)
 
-            # Нормализуем
-            z_seq = F.normalize(z_seq, dim=-1)
-            z_smi = F.normalize(z_smi, dim=-1)
-
             return z_seq, z_smi
 
 
@@ -288,7 +284,7 @@ if __name__ == '__main__':
             self.neg_threshold = neg_threshold  # Negative должны быть < этого
             self.neg_weight = neg_weight  # Насколько negative важнее
 
-            print(f"✅ SimpleContrastiveLoss:")
+            print(f"    SimpleContrastiveLoss:")
             print(f"   • Positive > {pos_threshold}")
             print(f"   • Negative < {neg_threshold}")
             print(f"   • Negative weight: {neg_weight}")
@@ -1085,3 +1081,4 @@ if __name__ == '__main__':
         print("   1. Крупные кластеры (>10 пар) - возможно, ошибки разметки")
         print("   2. Маленькие кластеры (2-5 пар) - сложные случаи для модели")
         print("   3. Выбросы (noise) - аномалии, возможно шум в данных")
+
