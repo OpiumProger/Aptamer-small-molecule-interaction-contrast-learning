@@ -32,7 +32,7 @@ class FinalContrastiveDataset(Dataset):
         self.n_neg = len(self.apt_neg)
         self.negative_ratio = min(negative_ratio, self.n_neg) if self.n_neg > 0 else 2
 
-        print(f"📊 Final dataset:")
+        print(f"    Final dataset:")
         print(f"   • Positive pairs: {self.n_pos}")
         print(f"   • Negative pairs: {self.n_neg}")
         print(f"   • Negative ratio: {self.negative_ratio}")
@@ -321,7 +321,7 @@ class FinalTrainer:
         return avg_loss, avg_acc, avg_top3
 
     def train(self, n_epochs=15, save_path='final_best_model.pth'):
-        print(f"\n🚀 Starting final training (max {n_epochs} epochs)...")
+        print(f"\nStarting final training (max {n_epochs} epochs)...")
 
         for epoch in range(1, n_epochs + 1):
             # Train
@@ -377,14 +377,14 @@ class FinalTrainer:
                     'history': self.history
                 }, save_path)
 
-                print(f"  💾 Saved best model (Val Acc: {val_acc:.3f})")
+                print(f"Saved best model (Val Acc: {val_acc:.3f})")
             else:
                 self.patience_counter += 1
-                print(f"  ⏳ No improvement: {self.patience_counter}/{self.patience}")
+                print(f"No improvement: {self.patience_counter}/{self.patience}")
 
             # Early stopping
             if self.patience_counter >= self.patience:
-                print(f"\n🛑 Early stopping at epoch {epoch}")
+                print(f"\n    Early stopping at epoch {epoch}")
                 print(f"   Best Val Accuracy: {self.best_val_acc:.3f}")
                 break
 
@@ -392,7 +392,7 @@ class FinalTrainer:
         if self.best_model_state is not None:
             self.model.load_state_dict(self.best_model_state)
 
-        print(f"\n✅ Training completed!")
+        print(f"\n Training completed!")
         print(f"   Best validation accuracy: {self.best_val_acc:.3f}")
         print(f"   Final train-val gap: {self.history['train_val_gap'][-1]:.3f}")
 
@@ -490,7 +490,7 @@ def visualize_embeddings(model, apt_pos, smi_pos, apt_neg, smi_neg, device,
     """
     Визуализация эмбеддингов с помощью PCA, t-SNE и UMAP
     """
-    print("\n🎨 Визуализация эмбеддингов...")
+    print("\n    Визуализация эмбеддингов...")
 
     model.eval()
 
@@ -640,7 +640,7 @@ def visualize_embeddings(model, apt_pos, smi_pos, apt_neg, smi_neg, device,
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.show()
 
-    print(f"✅ График сохранен: {save_path}")
+    print(f"График сохранен: {save_path}")
 
     return {
         'embeddings': all_embeddings,
@@ -961,4 +961,5 @@ def save_embeddings(model, apt_pos, smi_pos, apt_neg, smi_neg, device):
 
 if __name__ == '__main__':
     model, history, test_results = main()
+
 
