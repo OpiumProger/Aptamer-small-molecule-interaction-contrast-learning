@@ -15,7 +15,10 @@ import umap.umap_ as umap
 from sklearn.cluster import KMeans
 from sklearn.metrics import silhouette_score
 from mpl_toolkits.mplot3d import Axes3D
-
+from geomloss import SamplesLoss
+import ot
+from scipy.spatial.distance import cdist
+from wasserstein_utils import analyze_model_with_ot
 warnings.filterwarnings('ignore')
 
 
@@ -32,7 +35,7 @@ class FinalContrastiveDataset(Dataset):
         self.n_neg = len(self.apt_neg)
         self.negative_ratio = min(negative_ratio, self.n_neg) if self.n_neg > 0 else 2
 
-        print(f"    Final dataset:")
+        print(f"Final dataset:")
         print(f"   • Positive pairs: {self.n_pos}")
         print(f"   • Negative pairs: {self.n_neg}")
         print(f"   • Negative ratio: {self.negative_ratio}")
@@ -72,14 +75,14 @@ class MicroContrastiveModel(nn.Module):
 
         self.apt_encoder = nn.Sequential(
             nn.Linear(apt_dim, 64),
-            nn.LeakyReLU(),
+            nn.LeakyReLU(negative_slope = 0.01),
             nn.Dropout(0.4),  # ВЫСОКИЙ dropout
             nn.Linear(64, latent_dim)
         )
 
         self.mol_encoder = nn.Sequential(
             nn.Linear(mol_dim, 64),
-            nn.LeakyReLU(),
+            nn.LeakyReLU(negative_slope = 0.01),
             nn.Dropout(0.4),  # ВЫСОКИЙ dropout
             nn.Linear(64, latent_dim)
         )
@@ -139,7 +142,7 @@ class TemperatureScaledLoss(nn.Module):
     def __init__(self, init_temperature=0.2):
         super().__init__()
         self.temperature = nn.Parameter(torch.tensor(init_temperature))
-        print(f"🔥 Initial temperature: {init_temperature}")
+        print(f"Initial temperature: {init_temperature}")
 
     def forward(self, z_anchor, z_positive, z_negatives):
         batch_size = z_anchor.size(0)
@@ -384,7 +387,7 @@ class FinalTrainer:
 
             # Early stopping
             if self.patience_counter >= self.patience:
-                print(f"\n    Early stopping at epoch {epoch}")
+                print(f"\nEarly stopping at epoch {epoch}")
                 print(f"   Best Val Accuracy: {self.best_val_acc:.3f}")
                 break
 
@@ -392,7 +395,7 @@ class FinalTrainer:
         if self.best_model_state is not None:
             self.model.load_state_dict(self.best_model_state)
 
-        print(f"\n Training completed!")
+        print(f"\nTraining completed!")
         print(f"   Best validation accuracy: {self.best_val_acc:.3f}")
         print(f"   Final train-val gap: {self.history['train_val_gap'][-1]:.3f}")
 
@@ -487,14 +490,10 @@ def analyze_results(model, data_loader, device):
 
 def visualize_embeddings(model, apt_pos, smi_pos, apt_neg, smi_neg, device,
                          save_path='embedding_visualization.png'):
-    """
-    Визуализация эмбеддингов с помощью PCA, t-SNE и UMAP
-    """
-    print("\n    Визуализация эмбеддингов...")
+
+    print("\nВизуализация эмбеддингов...")
 
     model.eval()
-
-    # Получаем все эмбеддинги
     all_embeddings = []
     all_labels = []
 
@@ -802,9 +801,19 @@ def main():
             if len(apt_pos) > 0:
                 separation = pos_similarities.mean().item() - neg_similarities.mean().item()
                 print(f"    separation: {separation:.3f}")
+    ot_analysis = analyze_model_with_ot(
+        model=model,
+        apt_pos=apt_pos,
+        smi_pos=smi_pos,
+        apt_neg=apt_neg,
+        smi_neg=smi_neg,
+        device=device
+    )
 
     #save embeddings
     save_embeddings(model, apt_pos, smi_pos, apt_neg, smi_neg, device)
+
+
 
     return model, history, test_results
 
@@ -961,5 +970,7 @@ def save_embeddings(model, apt_pos, smi_pos, apt_neg, smi_neg, device):
 
 if __name__ == '__main__':
     model, history, test_results = main()
+
+
 
 
