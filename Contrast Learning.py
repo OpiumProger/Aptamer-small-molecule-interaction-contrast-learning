@@ -10,7 +10,7 @@ warnings.filterwarnings('ignore')
 
 from Loss import TemperatureScaledLoss
 from FinalTrainer import FinalTrainer
-from DataLoad import FinalContrastiveDataset
+from DataPrepare import FinalContrastiveDataset
 from Model import MicroContrastiveModel
 from load_data_and_visual_data import load_data, analyze_results, analyze_results_correct, visualize_embeddings_correct, visualize_embeddings_2d_simple
 
