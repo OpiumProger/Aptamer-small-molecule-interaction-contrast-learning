@@ -1,653 +1,20 @@
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-import pandas as pd
 from torch.utils.data import Dataset, DataLoader
 import matplotlib.pyplot as plt
-from tqdm import tqdm
-import os
 import warnings
-from sklearn.preprocessing import StandardScaler
-from sklearn.decomposition import PCA
-from sklearn.manifold import TSNE
-import umap.umap_ as umap
-from sklearn.cluster import KMeans
-from sklearn.metrics import silhouette_score
-from mpl_toolkits.mplot3d import Axes3D
-from geomloss import SamplesLoss
-import ot
-from scipy.spatial.distance import cdist
+
 from wasserstein_utils import analyze_model_with_ot
 warnings.filterwarnings('ignore')
 
+from Loss import TemperatureScaledLoss
+from FinalTrainer import FinalTrainer
+from DataLoad import FinalContrastiveDataset
+from Model import MicroContrastiveModel
+from load_data_and_visual_data import load_data, analyze_results, analyze_results_correct, visualize_embeddings_correct, visualize_embeddings_2d_simple
 
 
-class FinalContrastiveDataset(Dataset):
-
-    def __init__(self, apt_pos, smi_pos, apt_neg, smi_neg, negative_ratio=3):
-        self.apt_pos = torch.FloatTensor(apt_pos)
-        self.smi_pos = torch.FloatTensor(smi_pos)
-        self.apt_neg = torch.FloatTensor(apt_neg)
-        self.smi_neg = torch.FloatTensor(smi_neg)
-
-        self.n_pos = len(self.apt_pos)
-        self.n_neg = len(self.apt_neg)
-        self.negative_ratio = min(negative_ratio, self.n_neg) if self.n_neg > 0 else 2
-
-        print(f"Final dataset:")
-        print(f"   • Positive pairs: {self.n_pos}")
-        print(f"   • Negative pairs: {self.n_neg}")
-        print(f"   • Negative ratio: {self.negative_ratio}")
-
-    def __len__(self):
-        return self.n_pos
-
-    def __getitem__(self, idx):
-        anchor_apt = self.apt_pos[idx]
-        positive_smi = self.smi_pos[idx]
-
-        # Аугментация
-        if torch.rand(1).item() > 0.5:  # 50% chance
-            noise = torch.randn_like(anchor_apt) * 0.05
-            anchor_apt = anchor_apt + noise
-
-        # Случайные negatives
-        if self.n_neg > 0:
-            neg_indices = np.random.choice(self.n_neg, size=self.negative_ratio, replace=False)
-            negative_smis = self.smi_neg[neg_indices]
-        else:
-            neg_indices = np.random.choice(self.n_pos, size=self.negative_ratio, replace=False)
-            neg_indices = neg_indices[neg_indices != idx]
-            negative_smis = self.smi_pos[neg_indices]
-
-        return {
-            'anchor_apt': anchor_apt,
-            'positive_smi': positive_smi,
-            'negative_smis': negative_smis
-        }
-
-
-class MicroContrastiveModel(nn.Module):
-
-    def __init__(self, apt_dim, mol_dim, latent_dim=32, projection_dim=16):
-        super().__init__()
-
-        self.apt_encoder = nn.Sequential(
-            nn.Linear(apt_dim, 64),
-            nn.LeakyReLU(negative_slope = 0.01),
-            nn.Dropout(0.4),  # ВЫСОКИЙ dropout
-            nn.Linear(64, latent_dim)
-        )
-
-        self.mol_encoder = nn.Sequential(
-            nn.Linear(mol_dim, 64),
-            nn.LeakyReLU(negative_slope = 0.01),
-            nn.Dropout(0.4),  # ВЫСОКИЙ dropout
-            nn.Linear(64, latent_dim)
-        )
-
-        self.apt_projection = nn.Sequential(
-            nn.Linear(latent_dim, projection_dim),
-            nn.Dropout(0.3)
-        )
-
-        self.mol_projection = nn.Sequential(
-            nn.Linear(latent_dim, projection_dim),
-            nn.Dropout(0.3)
-        )
-
-        print(f"    Micro model created:")
-        print(f"   • Latent dim: {latent_dim}")
-        print(f"   • Projection dim: {projection_dim}")
-        print(f"   • Total params: {sum(p.numel() for p in self.parameters()):,}")
-
-    def encode_aptamer(self, x):
-        h = self.apt_encoder(x)
-        z = self.apt_projection(h)
-        return F.normalize(z, p=2, dim=-1)
-
-    def encode_molecule(self, x):
-        h = self.mol_encoder(x)
-        z = self.mol_projection(h)
-        return F.normalize(z, p=2, dim=-1)
-
-    def forward(self, anchor_apt, positive_smi, negative_smis=None):
-        z_anchor = self.encode_aptamer(anchor_apt)
-        z_positive = self.encode_molecule(positive_smi)
-
-        if negative_smis is not None and len(negative_smis) > 0:
-            batch_size, n_neg, mol_dim = negative_smis.shape
-            negatives_flat = negative_smis.view(-1, mol_dim)
-            z_negatives = self.encode_molecule(negatives_flat)
-            z_negatives = z_negatives.view(batch_size, n_neg, -1)
-
-            return {
-                'z_anchor': z_anchor,
-                'z_positive': z_positive,
-                'z_negatives': z_negatives
-            }
-
-        return {
-            'z_anchor': z_anchor,
-            'z_positive': z_positive
-        }
-
-
-#Loss
-
-class TemperatureScaledLoss(nn.Module):
-    """Loss с адаптивной температурой"""
-
-    def __init__(self, init_temperature=0.2):
-        super().__init__()
-        self.temperature = nn.Parameter(torch.tensor(init_temperature))
-        print(f"Initial temperature: {init_temperature}")
-
-    def forward(self, z_anchor, z_positive, z_negatives):
-        batch_size = z_anchor.size(0)
-        n_neg = z_negatives.size(1)
-
-        z_anchor = F.normalize(z_anchor, p=2, dim=1)
-        z_positive = F.normalize(z_positive, p=2, dim=1)
-        z_negatives = F.normalize(z_negatives.view(-1, z_negatives.size(-1)), p=2, dim=1)
-        z_negatives = z_negatives.view(batch_size, n_neg, -1)
-
-        # Positive similarity
-        pos_sim = torch.sum(z_anchor * z_positive, dim=1) / self.temperature
-
-        # Negative similarities
-        z_anchor_expanded = z_anchor.unsqueeze(1).expand(-1, n_neg, -1)
-        neg_sims = torch.sum(z_anchor_expanded * z_negatives, dim=2) / self.temperature
-
-        # Logits
-        logits = torch.cat([pos_sim.unsqueeze(1), neg_sims], dim=1)
-
-        # Labels
-        labels = torch.zeros(batch_size, dtype=torch.long).to(z_anchor.device)
-
-        # Loss
-        loss = F.cross_entropy(logits, labels)
-
-        # Metrics
-        with torch.no_grad():
-            preds = torch.argmax(logits, dim=1)
-            accuracy = (preds == labels).float().mean()
-
-            # Top-3 accuracy
-            sorted_indices = torch.argsort(logits, dim=1, descending=True)
-            top3_acc = (sorted_indices[:, :3] == 0).any(dim=1).float().mean()
-
-        metrics = {
-            'accuracy': accuracy.item(),
-            'top3_acc': top3_acc.item(),
-            'temperature': self.temperature.item(),
-            'loss': loss.item()
-        }
-
-        return loss, metrics
-
-
-
-class FinalTrainer:
-
-    def __init__(self, model, train_loader, val_loader, device='cuda'):
-        self.model = model.to(device)
-        self.train_loader = train_loader
-        self.val_loader = val_loader
-        self.device = device
-
-        # Loss function
-        self.criterion = TemperatureScaledLoss(init_temperature=0.25)
-
-        # Optimizer
-        self.optimizer = torch.optim.AdamW(
-            model.parameters(),
-            lr=1e-4,
-            weight_decay=5e-3
-        )
-
-        self.scheduler = torch.optim.lr_scheduler.StepLR(
-            self.optimizer, step_size=5, gamma=0.5
-        )
-
-        self.history = {
-            'train_loss': [], 'val_loss': [],
-            'train_acc': [], 'val_acc': [],
-            'train_top3': [], 'val_top3': [],
-            'temperature': [],
-            'train_val_gap': []
-        }
-
-        self.best_val_acc = 0
-        self.patience_counter = 0
-        self.patience = 5
-        self.best_model_state = None
-
-    def compute_l2_reg(self):
-        l2_reg = 0
-        for param in self.model.parameters():
-            l2_reg += torch.norm(param, p=2)
-        return l2_reg
-
-    def train_epoch(self, epoch):
-        self.model.train()
-        total_loss = 0
-        total_acc = 0
-        total_top3 = 0
-        n_batches = 0
-
-        pbar = tqdm(self.train_loader, desc=f'Epoch {epoch} [Train]')
-        for batch in pbar:
-            # Move to device
-            anchor_apt = batch['anchor_apt'].to(self.device)
-            positive_smi = batch['positive_smi'].to(self.device)
-            negative_smis = batch['negative_smis'].to(self.device)
-
-            # Forward pass
-            outputs = self.model(anchor_apt, positive_smi, negative_smis)
-
-            # Compute loss
-            loss, metrics = self.criterion(
-                outputs['z_anchor'],
-                outputs['z_positive'],
-                outputs['z_negatives']
-            )
-
-            l2_reg = self.compute_l2_reg()
-            total_loss_value = loss + 0.01 * l2_reg
-
-            # Backward pass
-            self.optimizer.zero_grad()
-            total_loss_value.backward()
-
-            # Gradient clipping
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 0.25)
-
-            self.optimizer.step()
-
-            # Update statistics
-            total_loss += loss.item()
-            total_acc += metrics['accuracy']
-            total_top3 += metrics['top3_acc']
-            n_batches += 1
-
-            # Update progress bar
-            pbar.set_postfix({
-                'loss': f"{loss.item():.4f}",
-                'acc': f"{metrics['accuracy']:.3f}",
-                'temp': f"{metrics['temperature']:.3f}"
-            })
-
-        # Average metrics
-        avg_loss = total_loss / n_batches if n_batches > 0 else 0
-        avg_acc = total_acc / n_batches if n_batches > 0 else 0
-        avg_top3 = total_top3 / n_batches if n_batches > 0 else 0
-
-        return avg_loss, avg_acc, avg_top3
-
-    def validate(self):
-        self.model.eval()
-        total_loss = 0
-        total_acc = 0
-        total_top3 = 0
-        n_batches = 0
-
-        with torch.no_grad():
-            for batch in self.val_loader:
-                # Move to device
-                anchor_apt = batch['anchor_apt'].to(self.device)
-                positive_smi = batch['positive_smi'].to(self.device)
-                negative_smis = batch['negative_smis'].to(self.device)
-
-                # Forward pass
-                outputs = self.model(anchor_apt, positive_smi, negative_smis)
-
-                # Compute loss
-                loss, metrics = self.criterion(
-                    outputs['z_anchor'],
-                    outputs['z_positive'],
-                    outputs['z_negatives']
-                )
-
-                # Update statistics
-                total_loss += loss.item()
-                total_acc += metrics['accuracy']
-                total_top3 += metrics['top3_acc']
-                n_batches += 1
-
-        # Average metrics
-        avg_loss = total_loss / n_batches if n_batches > 0 else 0
-        avg_acc = total_acc / n_batches if n_batches > 0 else 0
-        avg_top3 = total_top3 / n_batches if n_batches > 0 else 0
-
-        return avg_loss, avg_acc, avg_top3
-
-    def train(self, n_epochs=15, save_path='final_best_model.pth'):
-        print(f"\nStarting final training (max {n_epochs} epochs)...")
-
-        for epoch in range(1, n_epochs + 1):
-            # Train
-            train_loss, train_acc, train_top3 = self.train_epoch(epoch)
-
-            # Validate
-            val_loss, val_acc, val_top3 = self.validate()
-
-            # Update scheduler
-            self.scheduler.step()
-
-            # Save current temperature
-            current_temp = self.criterion.temperature.item()
-
-            # Calculate gap
-            gap = train_acc - val_acc
-
-            # Save to history
-            self.history['train_loss'].append(train_loss)
-            self.history['val_loss'].append(val_loss)
-            self.history['train_acc'].append(train_acc)
-            self.history['val_acc'].append(val_acc)
-            self.history['train_top3'].append(train_top3)
-            self.history['val_top3'].append(val_top3)
-            self.history['temperature'].append(current_temp)
-            self.history['train_val_gap'].append(gap)
-
-            # Print epoch summary
-            print(f"\n  Epoch {epoch:03d}/{n_epochs}")
-            print(f"  Train Loss: {train_loss:.4f} | Acc: {train_acc:.3f} | Top3: {train_top3:.3f}")
-            print(f"  Val   Loss: {val_loss:.4f} | Acc: {val_acc:.3f} | Top3: {val_top3:.3f}")
-            print(f"  Gap: {gap:.3f} | Temp: {current_temp:.3f} | LR: {self.optimizer.param_groups[0]['lr']:.2e}")
-
-            # Проверка на сильное переобучение
-            if train_acc > 0.85 and val_acc < 0.4:
-                print(f"CRITICAL OVERFITTING! Stopping...")
-                break
-
-            # Save best model
-            if val_acc > self.best_val_acc:
-                self.best_val_acc = val_acc
-                self.patience_counter = 0
-                self.best_model_state = self.model.state_dict().copy()
-
-                torch.save({
-                    'epoch': epoch,
-                    'model_state_dict': self.model.state_dict(),
-                    'optimizer_state_dict': self.optimizer.state_dict(),
-                    'val_acc': val_acc,
-                    'val_top3': val_top3,
-                    'train_acc': train_acc,
-                    'temperature': current_temp,
-                    'history': self.history
-                }, save_path)
-
-                print(f"Saved best model (Val Acc: {val_acc:.3f})")
-            else:
-                self.patience_counter += 1
-                print(f"No improvement: {self.patience_counter}/{self.patience}")
-
-            # Early stopping
-            if self.patience_counter >= self.patience:
-                print(f"\nEarly stopping at epoch {epoch}")
-                print(f"   Best Val Accuracy: {self.best_val_acc:.3f}")
-                break
-
-        # Берём лучшую модель
-        if self.best_model_state is not None:
-            self.model.load_state_dict(self.best_model_state)
-
-        print(f"\nTraining completed!")
-        print(f"   Best validation accuracy: {self.best_val_acc:.3f}")
-        print(f"   Final train-val gap: {self.history['train_val_gap'][-1]:.3f}")
-
-        return self.history
-
-
-
-def load_data(file_path):
-
-    print(f"\nLoading data from {os.path.basename(file_path)}")
-    df = pd.read_csv(file_path)
-
-    seq_emb_cols = [col for col in df.columns if col.startswith('seq_emb_')]
-    smi_emb_cols = [col for col in df.columns if col.startswith('smi_emb_')]
-
-    if not seq_emb_cols or not smi_emb_cols:
-        raise ValueError("No embedding columns found")
-
-    print(f"  Sequence embeddings: {len(seq_emb_cols)} columns")
-    print(f"  SMILES embeddings: {len(smi_emb_cols)} columns")
-
-    pos_mask = df['label'] == 1
-    neg_mask = df['label'] == 0
-
-    apt_pos = df.loc[pos_mask, seq_emb_cols].values.astype(np.float32)
-    smi_pos = df.loc[pos_mask, smi_emb_cols].values.astype(np.float32)
-    apt_neg = df.loc[neg_mask, seq_emb_cols].values.astype(np.float32)
-    smi_neg = df.loc[neg_mask, smi_emb_cols].values.astype(np.float32)
-
-    print(f"\nData statistics:")
-    print(f"  • Positive pairs: {len(apt_pos)}")
-    print(f"  • Negative pairs: {len(apt_neg)}")
-    print(f"  • Positive/Negative ratio: {len(apt_pos) / len(apt_neg):.2f}" if len(
-        apt_neg) > 0 else "  • No negative pairs")
-
-    return apt_pos, smi_pos, apt_neg, smi_neg, len(seq_emb_cols), len(smi_emb_cols)
-
-
-
-def analyze_results(model, data_loader, device):
-    """Анализ результатов модели"""
-    model.eval()
-
-    all_pos_sims = []
-    all_neg_sims = []
-    accuracies = []
-
-    with torch.no_grad():
-        for batch in data_loader:
-            anchor_apt = batch['anchor_apt'].to(device)
-            positive_smi = batch['positive_smi'].to(device)
-            negative_smis = batch['negative_smis'].to(device)
-
-            outputs = model(anchor_apt, positive_smi, negative_smis)
-
-            # Positive similarities
-            pos_sim = F.cosine_similarity(outputs['z_anchor'], outputs['z_positive'], dim=1)
-            all_pos_sims.extend(pos_sim.cpu().numpy())
-
-            # Negative similarities
-            batch_size, n_neg, _ = outputs['z_negatives'].shape
-            for i in range(batch_size):
-                neg_sims = F.cosine_similarity(
-                    outputs['z_anchor'][i:i + 1].expand(n_neg, -1),
-                    outputs['z_negatives'][i]
-                )
-                all_neg_sims.extend(neg_sims.cpu().numpy())
-
-                # Accuracy для этого примера
-                all_sims = torch.cat([pos_sim[i:i + 1], neg_sims])
-                if torch.argmax(all_sims) == 0:
-                    accuracies.append(1)
-                else:
-                    accuracies.append(0)
-
-    accuracy = np.mean(accuracies) if accuracies else 0
-    separation = np.mean(all_pos_sims) - np.mean(all_neg_sims) if all_pos_sims and all_neg_sims else 0
-
-    return {
-        'accuracy': accuracy,
-        'separation': separation,
-        'pos_mean': np.mean(all_pos_sims) if all_pos_sims else 0,
-        'neg_mean': np.mean(all_neg_sims) if all_neg_sims else 0,
-        'pos_std': np.std(all_pos_sims) if all_pos_sims else 0,
-        'neg_std': np.std(all_neg_sims) if all_neg_sims else 0,
-        'all_pos_sims': all_pos_sims,
-        'all_neg_sims': all_neg_sims
-    }
-
-
-# ==================== 7. ВИЗУАЛИЗАЦИЯ ЭМБЕДДИНГОВ (T-SNE, UMAP, PCA) ====================
-
-def visualize_embeddings(model, apt_pos, smi_pos, apt_neg, smi_neg, device,
-                         save_path='embedding_visualization.png'):
-
-    print("\nВизуализация эмбеддингов...")
-
-    model.eval()
-    all_embeddings = []
-    all_labels = []
-
-    with torch.no_grad():
-        # Positive пары
-        if len(apt_pos) > 0:
-            apt_pos_tensor = torch.FloatTensor(apt_pos).to(device)
-            smi_pos_tensor = torch.FloatTensor(smi_pos).to(device)
-
-            z_apt_pos = model.encode_aptamer(apt_pos_tensor)
-            z_smi_pos = model.encode_molecule(smi_pos_tensor)
-
-            # Конкатенируем эмбеддинги аптамеров и молекул
-            pos_combined = torch.cat([z_apt_pos, z_smi_pos], dim=1)
-            all_embeddings.append(pos_combined.cpu().numpy())
-            all_labels.extend([1] * len(pos_combined))
-
-        # Negative пары
-        if len(apt_neg) > 0:
-            apt_neg_tensor = torch.FloatTensor(apt_neg).to(device)
-            smi_neg_tensor = torch.FloatTensor(smi_neg).to(device)
-
-            z_apt_neg = model.encode_aptamer(apt_neg_tensor)
-            z_smi_neg = model.encode_molecule(smi_neg_tensor)
-
-            neg_combined = torch.cat([z_apt_neg, z_smi_neg], dim=1)
-            all_embeddings.append(neg_combined.cpu().numpy())
-            all_labels.extend([0] * len(neg_combined))
-
-    if not all_embeddings:
-        print("   Нет данных для визуализации")
-        return
-
-    all_embeddings = np.vstack(all_embeddings)
-    all_labels = np.array(all_labels)
-
-    print(f"   Всего эмбеддингов: {len(all_embeddings)}")
-    print(f"   Размерность: {all_embeddings.shape[1]}")
-
-    # Нормализуем данные
-    scaler = StandardScaler()
-    all_embeddings_scaled = scaler.fit_transform(all_embeddings)
-
-    # Проверяем количество компонент для PCA
-    n_components = min(50, all_embeddings_scaled.shape[1], all_embeddings_scaled.shape[0])
-
-    # Применяем PCA для уменьшения размерности
-    print(f"   Применение PCA для уменьшения размерности до {n_components} компонент...")
-    pca = PCA(n_components=n_components)
-    embeddings_pca = pca.fit_transform(all_embeddings_scaled)
-
-    print(f"   Объясненная дисперсия PCA: {pca.explained_variance_ratio_.sum():.3f}")
-
-    # Создаем фигуру для визуализации
-    fig = plt.figure(figsize=(15, 10))
-
-    # ==================== t-SNE ВИЗУАЛИЗАЦИЯ ====================
-    print("\n   Применение t-SNE для 2D визуализации...")
-
-    if len(all_embeddings) > 10:
-        perplexity_value = min(30, len(all_embeddings) - 1)
-
-        try:
-            tsne = TSNE(n_components=2, perplexity=perplexity_value,
-                        random_state=42, n_iter=1000, verbose=0)
-            embeddings_tsne = tsne.fit_transform(embeddings_pca)
-
-            ax1 = plt.subplot(2, 2, 1)
-
-            # Разделяем точки по классам
-            pos_indices = all_labels == 1
-            neg_indices = all_labels == 0
-
-            if pos_indices.sum() > 0:
-                ax1.scatter(embeddings_tsne[pos_indices, 0],
-                            embeddings_tsne[pos_indices, 1],
-                            c='green', alpha=0.6, s=30,
-                            label=f'Positive ({pos_indices.sum()})',
-                            edgecolors='black', linewidth=0.5)
-
-            if neg_indices.sum() > 0:
-                ax1.scatter(embeddings_tsne[neg_indices, 0],
-                            embeddings_tsne[neg_indices, 1],
-                            c='red', alpha=0.6, s=30,
-                            label=f'Negative ({neg_indices.sum()})',
-                            edgecolors='black', linewidth=0.5)
-
-            ax1.set_xlabel('t-SNE 1')
-            ax1.set_ylabel('t-SNE 2')
-            ax1.set_title('t-SNE 2D проекция')
-            ax1.legend()
-            ax1.grid(True, alpha=0.3)
-
-        except Exception as e:
-            print(f"     Ошибка t-SNE: {e}")
-            # Создаем пустой subplot если t-SNE не сработал
-            ax1 = plt.subplot(2, 2, 1)
-            ax1.text(0.5, 0.5, 't-SNE failed', ha='center', va='center')
-            ax1.set_title('t-SNE (failed)')
-
-    # ==================== UMAP ВИЗУАЛИЗАЦИЯ ====================
-    print("   Применение UMAP для 2D визуализации...")
-
-    if len(all_embeddings) > 10:
-        try:
-            n_neighbors_value = min(25, len(all_embeddings) - 1)
-            reducer = umap.UMAP(n_components=2, min_dist=0.3, random_state=42,
-                                n_neighbors=n_neighbors_value)
-            embeddings_umap = reducer.fit_transform(embeddings_pca)
-
-            ax2 = plt.subplot(2, 2, 2)
-
-            # Разделяем точки по классам
-            if pos_indices.sum() > 0:
-                ax2.scatter(embeddings_umap[pos_indices, 0],
-                            embeddings_umap[pos_indices, 1],
-                            c='green', alpha=0.6, s=30,
-                            label=f'Positive ({pos_indices.sum()})',
-                            edgecolors='black', linewidth=0.5)
-
-            if neg_indices.sum() > 0:
-                ax2.scatter(embeddings_umap[neg_indices, 0],
-                            embeddings_umap[neg_indices, 1],
-                            c='red', alpha=0.6, s=30,
-                            label=f'Negative ({neg_indices.sum()})',
-                            edgecolors='black', linewidth=0.5)
-
-            ax2.set_xlabel('UMAP 1')
-            ax2.set_ylabel('UMAP 2')
-            ax2.set_title('UMAP 2D проекция')
-            ax2.legend()
-            ax2.grid(True, alpha=0.3)
-
-        except Exception as e:
-            print(f"     Ошибка UMAP: {e}")
-            # Создаем пустой subplot если UMAP не сработал
-            ax2 = plt.subplot(2, 2, 2)
-            ax2.text(0.5, 0.5, 'UMAP failed', ha='center', va='center')
-            ax2.set_title('UMAP (failed)')
-
-    plt.suptitle('Embedding Visualizations', fontsize=16, fontweight='bold')
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=150, bbox_inches='tight')
-    plt.show()
-
-    print(f"График сохранен: {save_path}")
-
-    return {
-        'embeddings': all_embeddings,
-        'labels': all_labels,
-        'pca': embeddings_pca,
-        'tsne': embeddings_tsne if 'embeddings_tsne' in locals() else None,
-        'umap': embeddings_umap if 'embeddings_umap' in locals() else None
-    }
 
 
 
@@ -664,24 +31,62 @@ def main():
         print(f" Error loading data: {e}")
         return
 
-    # Create Dataset
-    dataset = FinalContrastiveDataset(
-        apt_pos, smi_pos, apt_neg, smi_neg,
-        negative_ratio=2
+    np.random.seed(42)
+
+    # Разделяем ПОЗИТИВНЫЕ пары
+    n_pos = len(apt_pos)
+    pos_indices = np.random.permutation(n_pos)
+
+    train_pos_size = int(0.7 * n_pos)
+    val_pos_size = int(0.15 * n_pos)
+
+    train_pos_idx = pos_indices[:train_pos_size]
+    val_pos_idx = pos_indices[train_pos_size:train_pos_size + val_pos_size]
+    test_pos_idx = pos_indices[train_pos_size + val_pos_size:]
+
+    # Разделяем НЕГАТИВНЫЕ пары (отдельно!)
+    n_neg = len(apt_neg)
+    neg_indices = np.random.permutation(n_neg)
+
+    train_neg_size = int(0.7 * n_neg)
+    val_neg_size = int(0.15 * n_neg)
+
+    train_neg_idx = neg_indices[:train_neg_size]
+    val_neg_idx = neg_indices[train_neg_size:train_neg_size + val_neg_size]
+    test_neg_idx = neg_indices[train_neg_size + val_neg_size:]
+
+    print(f"\nComplete pair-based split (positives AND negatives separated):")
+    print(f"  Total positive pairs: {n_pos}")
+    print(f"    Train pos: {len(train_pos_idx)}")
+    print(f"    Val pos: {len(val_pos_idx)}")
+    print(f"    Test pos: {len(test_pos_idx)}")
+    print(f"  Total negative pairs: {n_neg}")
+    print(f"    Train neg: {len(train_neg_idx)}")
+    print(f"    Val neg: {len(val_neg_idx)}")
+    print(f"    Test neg: {len(test_neg_idx)}")
+
+    train_dataset = FinalContrastiveDataset(
+        apt_pos[train_pos_idx],
+        smi_pos[train_pos_idx],
+        apt_neg[train_neg_idx],
+        smi_neg[train_neg_idx]
     )
 
-    # train/val/test
-    total_size = len(dataset)
-    train_size = int(0.7 * total_size)
-    val_size = int(0.15 * total_size)
-    test_size = total_size - train_size - val_size
-
-    generator = torch.Generator().manual_seed(42)
-    train_dataset, val_dataset, test_dataset = torch.utils.data.random_split(
-        dataset, [train_size, val_size, test_size], generator=generator
+    val_dataset = FinalContrastiveDataset(
+        apt_pos[val_pos_idx],
+        smi_pos[val_pos_idx],
+        apt_neg[val_neg_idx],
+        smi_neg[val_neg_idx]
     )
 
-    # Collate function
+    test_dataset = FinalContrastiveDataset(
+        apt_pos[test_pos_idx],
+        smi_pos[test_pos_idx],
+        apt_neg[test_neg_idx],
+        smi_neg[test_neg_idx]
+    )
+
+    # DataLoaders
     def collate_fn(batch):
         return {
             'anchor_apt': torch.stack([b['anchor_apt'] for b in batch]),
@@ -689,7 +94,6 @@ def main():
             'negative_smis': torch.stack([b['negative_smis'] for b in batch])
         }
 
-    # DataLoaders with batch size
     train_loader = DataLoader(
         train_dataset,
         batch_size=8,
@@ -714,16 +118,14 @@ def main():
         collate_fn=collate_fn
     )
 
-    print(f"\n  Dataset sizes:")
-    print(f"    Train: {len(train_dataset)}")
-    print(f"    Validation: {len(val_dataset)}")
-    print(f"    Test: {len(test_dataset)}")
-    print(f"    Batch size: 8 (very small!)")
+    print(f"\n📊 Final dataset sizes:")
+    print(f"    Train: {len(train_dataset)} positive pairs, {len(train_neg_idx)} negative pairs")
+    print(f"    Validation: {len(val_dataset)} positive pairs, {len(val_neg_idx)} negative pairs")
+    print(f"    Test: {len(test_dataset)} positive pairs, {len(test_neg_idx)} negative pairs")
 
     print("Creating mini model...")
     model = MicroContrastiveModel(
-        apt_dim=seq_dim,
-        mol_dim=smi_dim,
+        input_dim=seq_dim,
         latent_dim=32,
         projection_dim=16
     )
@@ -765,16 +167,12 @@ def main():
     except:
         print(" Используется текущая модель")
 
-    visualize_embeddings(
+    visualize_embeddings_correct(
         model=model,
-        apt_pos=apt_pos,
-        smi_pos=smi_pos,
-        apt_neg=apt_neg,
-        smi_neg=smi_neg,
+        test_loader=test_loader,
         device=device,
-        save_path='embedding_visualization.png'
+        save_path='embedding_visualization_correct.png'
     )
-
     with torch.no_grad():
         if len(apt_pos) > 0:
             apt_pos_tensor = torch.FloatTensor(apt_pos[:1000]).to(device)
