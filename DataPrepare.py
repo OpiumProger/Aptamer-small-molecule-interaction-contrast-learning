@@ -15,7 +15,7 @@ class FinalContrastiveDataset(Dataset):
         self.smi_neg = torch.FloatTensor(smi_neg)
 
         self.pos_count = len(self.apt_pos)
-        self.neg_count = len(self.smi_neg)
+        self.neg_count = len(self.apt_neg)
 
         self.negative_ratio = min(negative_ratio, self.neg_count)
 
@@ -24,22 +24,19 @@ class FinalContrastiveDataset(Dataset):
         print(f"  Negatives: {self.neg_count}")
 
     def __len__(self):
-        # каждый индекс = один anchor (aptamer)
         return self.pos_count
 
     def __getitem__(self, idx):
 
-        # Anchor (aptamer)
+        # ===== POSITIVE =====
         anchor_apt = self.apt_pos[idx]
-
-        # Positive (правильная молекула)
         positive_smi = self.smi_pos[idx]
 
-        # Negatives (случайные или hard)
+        # ===== TRUE NEGATIVE PAIRS (НО возвращаем только molecules) =====
         neg_indices = torch.randint(0, self.neg_count, (self.negative_ratio,))
         negative_smis = self.smi_neg[neg_indices]
 
-        # Лёгкая аугментация
+        # ===== АУГМЕНТАЦИЯ =====
         if torch.rand(1).item() > 0.5:
             anchor_apt = anchor_apt + torch.randn_like(anchor_apt) * 0.01
 
