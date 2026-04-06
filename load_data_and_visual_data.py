@@ -98,15 +98,17 @@ def analyze_results(model, data_loader, device):
 def visualize_embeddings_correct(model, test_loader, device, save_path='embedding_visualization_correct.png'):
     """
     ПРАВИЛЬНАЯ визуализация - использует ТЕ ЖЕ hard negatives, что и в тесте
+    Метрики теперь совпадают с analyze_results
     """
-    print("\n" + "=" * 60)
-    print("ПРАВИЛЬНАЯ ВИЗУАЛИЗАЦИЯ (с использованием test_loader)")
-    print("=" * 60)
 
     model.eval()
     all_embeddings = []
     all_labels = []
-    all_types = []  # 'anchor', 'positive', 'negative'
+    all_types = []
+
+    # Для хранения метрик (как в analyze_results)
+    all_pos_sims = []
+    all_neg_sims = []
 
     with torch.no_grad():
         for batch_idx, batch in enumerate(test_loader):
@@ -114,69 +116,94 @@ def visualize_embeddings_correct(model, test_loader, device, save_path='embeddin
             positive_smi = batch['positive_smi'].to(device)
             negative_smis = batch['negative_smis'].to(device)
 
-            # Получаем эмбеддинги
-            z_anchor = model.encode_aptamer(anchor_apt)  # (B, dim)
-            z_positive = model.encode_molecule(positive_smi)  # (B, dim)
+            # Получаем эмбеддинги через модель
+            z_anchor = model.encode_aptamer(anchor_apt)  # [B, 64]
+            z_positive = model.encode_molecule(positive_smi)  # [B, 64]
+
+            # Для негативов тоже нужно пропустить через модель!
+            B, K, D = negative_smis.shape
+            negatives_flat = negative_smis.view(B * K, D)
+            z_negatives = model.encode_molecule(negatives_flat)  # [B*K, 64]
+            z_negatives = z_negatives.view(B, K, -1)  # [B, K, 64]
 
             batch_size = z_anchor.size(0)
-            n_neg = negative_smis.size(1)
+            n_neg = z_negatives.size(1)
 
-            # Для каждого элемента в батче
+            # ===== ВЫЧИСЛЯЕМ МЕТРИКИ ТАК ЖЕ, КАК В analyze_results =====
+            # Positive similarities
+            pos_sim = F.cosine_similarity(z_anchor, z_positive, dim=1)
+            all_pos_sims.extend(pos_sim.cpu().numpy())
+
+            # Negative similarities
+            for i in range(batch_size):
+                neg_sims = F.cosine_similarity(
+                    z_anchor[i:i + 1].expand(n_neg, -1),
+                    z_negatives[i]
+                )
+                all_neg_sims.extend(neg_sims.cpu().numpy())
+
+            # ===== СОБИРАЕМ ЭМБЕДДИНГИ ДЛЯ ВИЗУАЛИЗАЦИИ =====
             for i in range(batch_size):
                 # Anchor (аптамер)
                 all_embeddings.append(z_anchor[i].cpu().numpy())
-                all_labels.append(1)  # positive class
+                all_labels.append(1)
                 all_types.append('anchor')
 
                 # Positive (малая молекула из той же пары)
                 all_embeddings.append(z_positive[i].cpu().numpy())
-                all_labels.append(1)  # positive class
+                all_labels.append(1)
                 all_types.append('positive')
 
-                # Hard negatives (сложные негативные молекулы)
+                # Hard negatives
                 for j in range(n_neg):
-                    z_neg = model.encode_molecule(negative_smis[i, j].unsqueeze(0))
-                    all_embeddings.append(z_neg[0].cpu().numpy())
-                    all_labels.append(0)  # negative class
+                    all_embeddings.append(z_negatives[i, j].cpu().numpy())
+                    all_labels.append(0)
                     all_types.append('hard_negative')
 
-            # Ограничиваем для визуализации (если данных слишком много)
-            if batch_idx > 50 and len(all_embeddings) > 5000:
-                print(f"   Ограничиваем выборку для визуализации: {len(all_embeddings)} точек")
-                break
 
+
+    all_pos_sims = np.array(all_pos_sims)
+    all_neg_sims = np.array(all_neg_sims)
+
+    # Вычисляем accuracy
+    n_examples = len(all_pos_sims)
+    n_neg_per_example = len(all_neg_sims) // n_examples if n_examples > 0 else 3
+
+    accuracies = []
+    for i in range(n_examples):
+        pos_sim_val = all_pos_sims[i]
+        neg_sims_vals = all_neg_sims[i * n_neg_per_example:(i + 1) * n_neg_per_example]
+        if len(neg_sims_vals) > 0:
+            if pos_sim_val > np.max(neg_sims_vals):
+                accuracies.append(1)
+            else:
+                accuracies.append(0)
+
+    accuracy = np.mean(accuracies) if accuracies else 0
+    separation = np.mean(all_pos_sims) - np.mean(all_neg_sims)
+
+    print(f"\n МЕТРИКИ НА ВИЗУАЛИЗАЦИИ:")
+    print(f"  • Positive similarity: {np.mean(all_pos_sims):.4f} (σ={np.std(all_pos_sims):.4f})")
+    print(f"  • Negative similarity: {np.mean(all_neg_sims):.4f} (σ={np.std(all_neg_sims):.4f})")
+    print(f"  • Separation: {separation:.4f}")
+    print(f"  • Accuracy: {accuracy:.4f}")
+
+    # ===== ПОДГОТОВКА ДАННЫХ ДЛЯ ВИЗУАЛИЗАЦИИ =====
     all_embeddings = np.array(all_embeddings)
     all_labels = np.array(all_labels)
+
+    # Если данных слишком много для визуализации, делаем случайную подвыборку
+    max_points_for_viz = 5000
+    if len(all_embeddings) > max_points_for_viz:
+        print(f"\n   Делаем подвыборку для визуализации: {len(all_embeddings)} → {max_points_for_viz}")
+        indices = np.random.choice(len(all_embeddings), max_points_for_viz, replace=False)
+        all_embeddings = all_embeddings[indices]
+        all_labels = all_labels[indices]
 
     print(f"\nСтатистика выборки для визуализации:")
     print(f"  • Всего точек: {len(all_embeddings)}")
     print(f"  • Positive (anchor + positive): {(all_labels == 1).sum()}")
     print(f"  • Negative (hard negatives): {(all_labels == 0).sum()}")
-
-    # Вычисляем метрики (должны совпадать с тестовыми!)
-    pos_embeddings = all_embeddings[all_labels == 1]
-    neg_embeddings = all_embeddings[all_labels == 0]
-
-    # Считаем сходства для anchor-positive пар
-    pos_sims = []
-    for i in range(0, len(pos_embeddings), 2):
-        if i + 1 < len(pos_embeddings):
-            sim = np.dot(pos_embeddings[i], pos_embeddings[i + 1])
-            pos_sims.append(sim)
-
-    # Считаем сходства для anchor-hard_negative пар
-    neg_sims = []
-    for i in range(0, len(neg_embeddings), 1):
-        # Каждый hard negative сравниваем с соответствующим anchor
-        anchor_idx = (i // 1) * 2
-        if anchor_idx < len(pos_embeddings):
-            sim = np.dot(pos_embeddings[anchor_idx], neg_embeddings[i])
-            neg_sims.append(sim)
-
-    print(f"\n📊 МЕТРИКИ НА ВИЗУАЛИЗАЦИИ (должны совпадать с тестом):")
-    print(f"  • Positive similarity: {np.mean(pos_sims):.4f} (σ={np.std(pos_sims):.4f})")
-    print(f"  • Negative similarity: {np.mean(neg_sims):.4f} (σ={np.std(neg_sims):.4f})")
-    print(f"  • Separation: {np.mean(pos_sims) - np.mean(neg_sims):.4f}")
 
     # Нормализация для визуализации
     scaler = StandardScaler()
@@ -201,7 +228,6 @@ def visualize_embeddings_correct(model, test_loader, device, save_path='embeddin
                     random_state=42, max_iter=1000, verbose=0)
         embeddings_tsne = tsne.fit_transform(embeddings_pca)
 
-        # Рисуем
         pos_mask = all_labels == 1
         neg_mask = all_labels == 0
 
@@ -259,10 +285,10 @@ def visualize_embeddings_correct(model, test_loader, device, save_path='embeddin
 
     # 4. Распределение сходств
     ax4 = fig.add_subplot(2, 3, 4)
-    ax4.hist(pos_sims, bins=30, alpha=0.6, color='green',
-             label=f'Positive (μ={np.mean(pos_sims):.3f})', density=True)
-    ax4.hist(neg_sims, bins=30, alpha=0.6, color='red',
-             label=f'Hard Negative (μ={np.mean(neg_sims):.3f})', density=True)
+    ax4.hist(all_pos_sims, bins=30, alpha=0.6, color='green',
+             label=f'Positive (μ={np.mean(all_pos_sims):.3f})', density=True)
+    ax4.hist(all_neg_sims, bins=30, alpha=0.6, color='red',
+             label=f'Hard Negative (μ={np.mean(all_neg_sims):.3f})', density=True)
     ax4.set_xlabel('Cosine Similarity')
     ax4.set_ylabel('Density')
     ax4.set_title('Similarity Distribution (Test Data)')
@@ -271,7 +297,7 @@ def visualize_embeddings_correct(model, test_loader, device, save_path='embeddin
 
     # 5. Box plot
     ax5 = fig.add_subplot(2, 3, 5)
-    box_data = [pos_sims, neg_sims]
+    box_data = [all_pos_sims, all_neg_sims]
     bp = ax5.boxplot(box_data, labels=['Positive', 'Hard Negative'], patch_artist=True)
     bp['boxes'][0].set_facecolor('lightgreen')
     bp['boxes'][1].set_facecolor('lightcoral')
@@ -279,12 +305,13 @@ def visualize_embeddings_correct(model, test_loader, device, save_path='embeddin
     ax5.set_title('Similarity Statistics')
     ax5.grid(True, alpha=0.3)
 
-    # 6. 3D PCA (если размерность позволяет)
+    # 6. 3D PCA
     ax6 = fig.add_subplot(2, 3, 6, projection='3d')
     if embeddings_scaled.shape[1] >= 3:
         pca_3d = PCA(n_components=3)
-        embeddings_pca_3d = pca_3d.fit_transform(embeddings_scaled[:3000])  # ограничиваем для 3D
-        labels_3d = all_labels[:3000]
+        sample_size = min(3000, len(embeddings_scaled))
+        embeddings_pca_3d = pca_3d.fit_transform(embeddings_scaled[:sample_size])
+        labels_3d = all_labels[:sample_size]
 
         pos_mask_3d = labels_3d == 1
         neg_mask_3d = labels_3d == 0
@@ -297,7 +324,7 @@ def visualize_embeddings_correct(model, test_loader, device, save_path='embeddin
                     embeddings_pca_3d[neg_mask_3d, 1],
                     embeddings_pca_3d[neg_mask_3d, 2],
                     c='red', alpha=0.5, s=10, label='Hard Negative')
-        ax6.set_title('PCA 3D (first 3000 points)')
+        ax6.set_title('PCA 3D')
         ax6.legend()
     else:
         ax6.text(0.5, 0.5, '3D PCA not available', ha='center', va='center')
@@ -309,20 +336,22 @@ def visualize_embeddings_correct(model, test_loader, device, save_path='embeddin
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.show()
 
-    print(f"\n✅ Визуализация сохранена: {save_path}")
+    print(f"\n Визуализация сохранена: {save_path}")
 
     return {
         'embeddings': all_embeddings,
         'labels': all_labels,
-        'pos_sims': pos_sims,
-        'neg_sims': neg_sims
+        'pos_sims': all_pos_sims,
+        'neg_sims': all_neg_sims,
+        'accuracy': accuracy,
+        'separation': separation,
+        'pos_mean': np.mean(all_pos_sims),
+        'neg_mean': np.mean(all_neg_sims)
     }
 
 
 def analyze_results_correct(model, data_loader, device):
-    """
-    ПРАВИЛЬНЫЙ анализ - только hard negatives из теста
-    """
+
     model.eval()
 
     all_pos_sims = []
@@ -394,9 +423,6 @@ def visualize_embeddings_2d_simple(model, test_loader, device, save_path='embedd
     """
     Простая 2D визуализация через PCA
     """
-    print("\n" + "=" * 60)
-    print("ПРОСТАЯ 2D ВИЗУАЛИЗАЦИЯ")
-    print("=" * 60)
 
     model.eval()
     all_embeddings = []
@@ -455,4 +481,4 @@ def visualize_embeddings_2d_simple(model, test_loader, device, save_path='embedd
     plt.savefig(save_path, dpi=150)
     plt.show()
 
-    print(f"✅ Простая визуализация сохранена: {save_path}")
+    print(f"Визуализация сохранена: {save_path}")
