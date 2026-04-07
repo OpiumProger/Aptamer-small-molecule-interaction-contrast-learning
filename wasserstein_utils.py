@@ -10,18 +10,12 @@ warnings.filterwarnings('ignore')
 
 
 class PairDistanceAnalyzer:
-    """
-    Анализатор для пар (аптамер, молекула) на основе расстояний между ними.
-    Правильный подход для задачи предсказания связывания.
-    """
 
     def __init__(self, pos_distances, neg_distances, pos_similarities=None, neg_similarities=None):
         """
         Параметры:
             pos_distances: array [N_pos] - расстояния для позитивных пар (1 - cosine_similarity)
             neg_distances: array [N_neg] - расстояния для негативных пар
-            pos_similarities: array [N_pos] - косинусные сходства для позитивных пар (опционально)
-            neg_similarities: array [N_neg] - косинусные сходства для негативных пар (опционально)
         """
         self.pos_distances = np.array(pos_distances).flatten()
         self.neg_distances = np.array(neg_distances).flatten()
@@ -142,7 +136,7 @@ class PairDistanceAnalyzer:
         распределений позитивных и негативных пар.
 
         Параметры:
-            method: 'quantile' (рекомендуется) или 'overlap'
+            method: 'quantile'  или 'overlap'
             pos_quantile: верхний квантиль для позитивных расстояний (по умолчанию 75%)
             neg_quantile: нижний квантиль для негативных расстояний (по умолчанию 25%)
         """
@@ -156,7 +150,6 @@ class PairDistanceAnalyzer:
             neg_lower = np.percentile(self.neg_distances, neg_quantile)
 
             # Зона неопределенности: где позитивные > pos_upper ИЛИ негативные < neg_lower
-            # Но правильнее: где распределения перекрываются наиболее сильно
             ambiguous_threshold_low = min(pos_upper, neg_lower)
             ambiguous_threshold_high = max(pos_upper, neg_lower)
 
