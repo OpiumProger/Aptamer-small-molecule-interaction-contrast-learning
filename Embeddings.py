@@ -1,15 +1,14 @@
-# import os
-#
-# os.environ["USE_TF"] = "0"
-# os.environ["TRANSFORMERS_NO_TF"] = "1"
-# os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+import os
+
+os.environ["USE_TF"] = "0"
+os.environ["TRANSFORMERS_NO_TF"] = "1"
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 
 import pandas as pd
 import torch
 import numpy as np
-from transformers import AutoTokenizer, AutoModelForMaskedLM, AutoModel
+from transformers import AutoTokenizer, AutoModelForMaskedLM, AutoModel,T5EncoderModel
 from tqdm import tqdm
-
 
 def data_prepare(data, sequence_column='sequence', smiles_column='canonical_smiles'):
     df = pd.read_csv(data)
@@ -85,6 +84,8 @@ def data_prepare(data, sequence_column='sequence', smiles_column='canonical_smil
 
     # Возвращаем DataFrame, очищенные последовательности и индексы
     return df, clean_sequences, clean_smiles, clean_indices
+
+
 
 
 def aptamer_encode(clean_sequences):
