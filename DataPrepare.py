@@ -9,63 +9,63 @@ warnings.filterwarnings('ignore')
 class FinalContrastiveDataset(Dataset):
     def __init__(self, apt_pos, smi_pos, apt_neg, smi_neg, negative_ratio=3):
 
-        self.apt_to_pos = defaultdict(list)
-        self.apt_to_neg = defaultdict(list)
+        self.smi_to_pos = defaultdict(list)
+        self.smi_to_neg = defaultdict(list)
 
         for apt, smi in zip(apt_pos, smi_pos):
-            self.apt_to_pos[tuple(apt)].append(smi)
+            self.smi_to_pos[tuple(smi)].append(apt)
 
         for apt, smi in zip(apt_neg, smi_neg):
-            self.apt_to_neg[tuple(apt)].append(smi)
+            self.smi_to_neg[tuple(smi)].append(apt)
 
-        self.apts = list(self.apt_to_pos.keys())
+        self.smis = list(self.smi_to_pos.keys())
 
         self.negative_ratio = negative_ratio
 
         print(f"Dataset created:")
-        print(f"  Unique aptamers: {len(self.apts)}")
-        print(f"  Total positive pairs: {sum(len(v) for v in self.apt_to_pos.values())}")
-        print(f"  Total negative pairs: {sum(len(v) for v in self.apt_to_neg.values())}")
+        print(f"  Unique molecules: {len(self.smis)}")
+        print(f"  Total positive pairs: {sum(len(v) for v in self.smi_to_pos.values())}")
+        print(f"  Total negative pairs: {sum(len(v) for v in self.smi_to_neg.values())}")
 
     def __len__(self):
-        return len(self.apts)
+        return len(self.smis)
 
     def __getitem__(self, idx):
 
-        # ===== ВЫБИРАЕМ АПТАМЕР =====
-        apt = self.apts[idx]
-        anchor_apt = torch.FloatTensor(apt)
+        # ВЫБИРАЕМ Молекулу
+        smi = self.smis[idx]
+        anchor_smi = torch.FloatTensor(smi)
 
-        # ===== POSITIVE (СЛУЧАЙНЫЙ ИЗ МНОЖЕСТВА) =====
-        pos_list = self.apt_to_pos[apt]
-        positive_smi = torch.FloatTensor(
+        # POSITIVE (СЛУЧАЙНЫЙ ИЗ МНОЖЕСТВА)
+        pos_list = self.smi_to_pos[smi]
+        positive_apts = torch.FloatTensor(
             pos_list[random.randint(0, len(pos_list) - 1)]
         )
 
-        # ===== NEGATIVES (ТОЛЬКО ДЛЯ ЭТОГО ЖЕ АПТАМЕРА) =====
-        neg_list = self.apt_to_neg.get(apt, [])
+        # NEGATIVES (ТОЛЬКО ДЛЯ ЭТОй же молекулы)
+        neg_list = self.smi_to_neg.get(smi, [])
 
         if len(neg_list) > 0:
             indices = torch.randint(0, len(neg_list), (self.negative_ratio,))
-            negative_smis = torch.stack([
+            negative_apts = torch.stack([
                 torch.FloatTensor(neg_list[i]) for i in indices
             ])
         else:
             # fallback если нет явных негативов
-            negative_smis = torch.zeros(
+            negative_apts = torch.zeros(
                 self.negative_ratio,
-                positive_smi.shape[0]
+                positive_apts.shape[0]
             )
 
-        # # ===== АУГМЕНТАЦИЯ (опционально) =====
-        # if torch.rand(1).item() > 0.5:
-        #     anchor_apt = anchor_apt + torch.randn_like(anchor_apt) * 0.01
-        #
-        # if torch.rand(1).item() > 0.5:
-        #     positive_smi = positive_smi + torch.randn_like(positive_smi) * 0.01
+        # АУГМЕНТАЦИЯ
+        if torch.rand(1).item() > 0.5:
+            anchor_smi = anchor_smi + torch.randn_like(anchor_smi) * 0.01
+
+        if torch.rand(1).item() > 0.5:
+            positive_apts = positive_apts + torch.randn_like(positive_apts) * 0.01
 
         return {
-            'anchor_apt': anchor_apt,
-            'positive_smi': positive_smi,
-            'negative_smis': negative_smis
+            'anchor_smi': anchor_smi,
+            'positive_apts': positive_apts,
+            'negative_apts': negative_apts
         }
