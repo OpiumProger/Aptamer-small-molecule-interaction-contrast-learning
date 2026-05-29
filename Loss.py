@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import warnings
-
+import numpy as np
 warnings.filterwarnings('ignore')
 
 
@@ -11,15 +11,12 @@ warnings.filterwarnings('ignore')
 class TemperatureScaledLoss(nn.Module):
     def __init__(self, init_temperature=0.25):
         super().__init__()
-        self.log_temperature = nn.Parameter(
-            torch.tensor(float(torch.log(torch.tensor(init_temperature))), dtype=torch.float32)
-        )
+        self.log_temperature = nn.Parameter(torch.tensor(np.log(init_temperature)))
 
     def get_temperature(self):
-        return torch.exp(self.log_temperature)
+        return torch.exp(self.log_temperature).clamp(0.07, 0.5)
 
     def forward(self, z_anchor, z_positive, z_negatives):
-        temperature = torch.exp(self.log_temperature.clamp(-10, 10))
         B = z_anchor.size(0)
         temp = self.get_temperature()
 
