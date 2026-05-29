@@ -52,11 +52,11 @@ def analyze_results(model, data_loader, device):
 
     with torch.no_grad():
         for batch in data_loader:
-            anchor_apt = batch['anchor_apt'].to(device)
-            positive_smi = batch['positive_smi'].to(device)
-            negative_smis = batch['negative_smis'].to(device)
+            anchor_smi = batch['anchor_smi'].to(device)
+            positive_apts = batch['positive_apts'].to(device)
+            negative_apts = batch['negative_apts'].to(device)
 
-            outputs = model(anchor_apt, positive_smi, negative_smis)
+            outputs = model(anchor_smi, positive_apts, negative_apts)
 
             # Positive similarities
             pos_sim = F.cosine_similarity(outputs['z_anchor'], outputs['z_positive'], dim=1)
@@ -93,43 +93,36 @@ def analyze_results(model, data_loader, device):
     }
 
 
-# ==================== 7. ВИЗУАЛИЗАЦИЯ ЭМБЕДДИНГОВ (T-SNE, UMAP, PCA) ====================
+# ВИЗУАЛИЗАЦИЯ ЭМБЕДДИНГОВ (T-SNE, UMAP, PCA) =
 
 def visualize_embeddings_correct(model, test_loader, device, save_path='embedding_visualization_correct.png'):
-    """
-    ПРАВИЛЬНАЯ визуализация - использует ТЕ ЖЕ hard negatives, что и в тесте
-    Метрики теперь совпадают с analyze_results
-    """
-
     model.eval()
     all_embeddings = []
     all_labels = []
     all_types = []
 
-    # Для хранения метрик (как в analyze_results)
     all_pos_sims = []
     all_neg_sims = []
 
     with torch.no_grad():
         for batch_idx, batch in enumerate(test_loader):
-            anchor_apt = batch['anchor_apt'].to(device)
-            positive_smi = batch['positive_smi'].to(device)
-            negative_smis = batch['negative_smis'].to(device)
+            anchor_smi = batch['anchor_smi'].to(device)
+            positive_apts = batch['positive_apts'].to(device)
+            negative_apts = batch['negative_apts'].to(device)
 
             # Получаем эмбеддинги через модель
-            z_anchor = model.encode_aptamer(anchor_apt)  # [B, 64]
-            z_positive = model.encode_molecule(positive_smi)  # [B, 64]
+            z_anchor = model.encode_molecule(anchor_smi)  # [B, 64]
+            z_positive = model.encode_aptamer(positive_apts)  # [B, 64]
 
             # Для негативов тоже нужно пропустить через модель!
-            B, K, D = negative_smis.shape
-            negatives_flat = negative_smis.view(B * K, D)
-            z_negatives = model.encode_molecule(negatives_flat)  # [B*K, 64]
+            B, K, D = negative_apts.shape
+            negatives_flat = negative_apts.view(B * K, D)
+            z_negatives = model.encode_aptamer(negatives_flat)  # [B*K, 64]
             z_negatives = z_negatives.view(B, K, -1)  # [B, K, 64]
 
             batch_size = z_anchor.size(0)
             n_neg = z_negatives.size(1)
 
-            # ===== ВЫЧИСЛЯЕМ МЕТРИКИ ТАК ЖЕ, КАК В analyze_results =====
             # Positive similarities
             pos_sim = F.cosine_similarity(z_anchor, z_positive, dim=1)
             all_pos_sims.extend(pos_sim.cpu().numpy())
@@ -142,7 +135,6 @@ def visualize_embeddings_correct(model, test_loader, device, save_path='embeddin
                 )
                 all_neg_sims.extend(neg_sims.cpu().numpy())
 
-            # ===== СОБИРАЕМ ЭМБЕДДИНГИ ДЛЯ ВИЗУАЛИЗАЦИИ =====
             for i in range(batch_size):
                 # Anchor (аптамер)
                 all_embeddings.append(z_anchor[i].cpu().numpy())
@@ -188,7 +180,7 @@ def visualize_embeddings_correct(model, test_loader, device, save_path='embeddin
     print(f"  • Separation: {separation:.4f}")
     print(f"  • Accuracy: {accuracy:.4f}")
 
-    # ===== ПОДГОТОВКА ДАННЫХ ДЛЯ ВИЗУАЛИЗАЦИИ =====
+
     all_embeddings = np.array(all_embeddings)
     all_labels = np.array(all_labels)
 
@@ -346,7 +338,8 @@ def visualize_embeddings_correct(model, test_loader, device, save_path='embeddin
         'accuracy': accuracy,
         'separation': separation,
         'pos_mean': np.mean(all_pos_sims),
-        'neg_mean': np.mean(all_neg_sims)
+        'neg_mean': np.mean(all_neg_sims),
+        'umap_coords': embeddings_umap if 'embeddings_umap' in locals() else None
     }
 
 
@@ -430,12 +423,12 @@ def visualize_embeddings_2d_simple(model, test_loader, device, save_path='embedd
 
     with torch.no_grad():
         for batch in test_loader:
-            anchor_apt = batch['anchor_apt'].to(device)
-            positive_smi = batch['positive_smi'].to(device)
-            negative_smis = batch['negative_smis'].to(device)
+            anchor_smi = batch['anchor_smi'].to(device)
+            positive_apts = batch['positive_apts'].to(device)
+            negative_apts = batch['negative_apts'].to(device)
 
-            z_anchor = model.encode_aptamer(anchor_apt)
-            z_positive = model.encode_molecule(positive_smi)
+            z_anchor = model.encode_molecule(anchor_smi)
+            z_positive = model.encode_aptamer(positive_apts)
 
             batch_size = z_anchor.size(0)
 
@@ -448,8 +441,8 @@ def visualize_embeddings_2d_simple(model, test_loader, device, save_path='embedd
                 all_labels.append(1)
 
                 # Hard negatives
-                for j in range(negative_smis.size(1)):
-                    z_neg = model.encode_molecule(negative_smis[i, j].unsqueeze(0))
+                for j in range(negative_apts.size(1)):
+                    z_neg = model.encode_aptamer(negative_apts[i, j].unsqueeze(0))
                     all_embeddings.append(z_neg[0].cpu().numpy())
                     all_labels.append(0)
 
