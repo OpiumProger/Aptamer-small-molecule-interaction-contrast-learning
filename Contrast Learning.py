@@ -1,18 +1,16 @@
 import torch
-import torch.nn.functional as F
 import numpy as np
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader
 import matplotlib.pyplot as plt
 import warnings
 
-from wasserstein_utils import analyze_model_with_ot
+
 warnings.filterwarnings('ignore')
 
-from Loss import TemperatureScaledLoss
 from FinalTrainer import FinalTrainer
 from DataPrepare import FinalContrastiveDataset
 from Model import MicroContrastiveModel
-from load_data_and_visual_data import load_data, analyze_results, analyze_results_correct, visualize_embeddings_correct, visualize_embeddings_2d_simple
+from load_data_and_visual_data import load_data, analyze_results, visualize_embeddings_correct, visualize_embeddings_2d_simple
 
 
 
@@ -24,7 +22,7 @@ def main():
     print("=" * 70)
 
     # Data load
-    data_file = "AptaBench_dataset_v2_with_embeddings.csv"
+    data_file = "aptabench_with_embeddings.csv"
     try:
         apt_pos, smi_pos, apt_neg, smi_neg, seq_dim, smi_dim = load_data(data_file)
     except Exception as e:
@@ -34,7 +32,7 @@ def main():
     np.random.seed(42)
 
     # Разделяем ПОЗИТИВНЫЕ пары
-    n_pos = len(apt_pos)
+    n_pos = len(smi_pos)
     pos_indices = np.random.permutation(n_pos)
 
     train_pos_size = int(0.7 * n_pos)
@@ -45,7 +43,7 @@ def main():
     test_pos_idx = pos_indices[train_pos_size + val_pos_size:]
 
     # Разделяем НЕГАТИВНЫЕ пары (отдельно!)
-    n_neg = len(apt_neg)
+    n_neg = len(smi_neg)
     neg_indices = np.random.permutation(n_neg)
 
     train_neg_size = int(0.7 * n_neg)
@@ -89,14 +87,14 @@ def main():
     # DataLoaders
     def collate_fn(batch):
         return {
-            'anchor_apt': torch.stack([b['anchor_apt'] for b in batch]),
-            'positive_smi': torch.stack([b['positive_smi'] for b in batch]),
-            'negative_smis': torch.stack([b['negative_smis'] for b in batch])
+            'anchor_smi': torch.stack([b['anchor_smi'] for b in batch]),
+            'positive_apts': torch.stack([b['positive_apts'] for b in batch]),
+            'negative_apts': torch.stack([b['negative_apts'] for b in batch])
         }
 
     train_loader = DataLoader(
         train_dataset,
-        batch_size=8,
+        batch_size=32,
         shuffle=True,
         num_workers=0,
         collate_fn=collate_fn
@@ -104,7 +102,7 @@ def main():
 
     val_loader = DataLoader(
         val_dataset,
-        batch_size=8,
+        batch_size=32,
         shuffle=False,
         num_workers=0,
         collate_fn=collate_fn
@@ -112,22 +110,23 @@ def main():
 
     test_loader = DataLoader(
         test_dataset,
-        batch_size=8,
+        batch_size=32,
         shuffle=False,
         num_workers=0,
         collate_fn=collate_fn
     )
 
-    print(f"\n📊 Final dataset sizes:")
+    print(f"\n Final dataset sizes:")
     print(f"    Train: {len(train_dataset)} positive pairs, {len(train_neg_idx)} negative pairs")
     print(f"    Validation: {len(val_dataset)} positive pairs, {len(val_neg_idx)} negative pairs")
     print(f"    Test: {len(test_dataset)} positive pairs, {len(test_neg_idx)} negative pairs")
 
     print("Creating mini model...")
     model = MicroContrastiveModel(
-        input_dim=seq_dim,
-        latent_dim=32,
-        projection_dim=16
+        input_dim_apt=768,  # размерность эмбеддингов аптамеров
+        input_dim_mol=768,  # размерность эмбеддингов молекул
+        latent_dim=768,
+        projection_dim=768
     )
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -142,7 +141,7 @@ def main():
 
     # training
     print("\n Starting training...")
-    history = trainer.train(n_epochs=12, save_path='final_micro_model.pth')
+    history = trainer.train(n_epochs=15, save_path='final_micro_model.pth')
 
     plot_final_results(history)
 
@@ -173,38 +172,12 @@ def main():
         device=device,
         save_path='embedding_visualization_correct.png'
     )
-    with torch.no_grad():
-        if len(apt_pos) > 0:
-            apt_pos_tensor = torch.FloatTensor(apt_pos[:1000]).to(device)
-            smi_pos_tensor = torch.FloatTensor(smi_pos[:1000]).to(device)
 
-            z_apt = model.encode_aptamer(apt_pos_tensor)
-            z_smi = model.encode_molecule(smi_pos_tensor)
+    from wasserstein_utils import analyze_model_with_loader
 
-            pos_similarities = F.cosine_similarity(z_apt, z_smi, dim=1)
-            print(f"     Positive среднее сходство: {pos_similarities.mean().item():.3f}")
-            print(f"     Positive std сходство: {pos_similarities.std().item():.3f}")
-
-        if len(apt_neg) > 0:
-            apt_neg_tensor = torch.FloatTensor(apt_neg[:1000]).to(device)
-            smi_neg_tensor = torch.FloatTensor(smi_neg[:1000]).to(device)
-
-            z_apt = model.encode_aptamer(apt_neg_tensor)
-            z_smi = model.encode_molecule(smi_neg_tensor)
-
-            neg_similarities = F.cosine_similarity(z_apt, z_smi, dim=1)
-            print(f"   • Negative среднее сходство: {neg_similarities.mean().item():.3f}")
-            print(f"   • Negative std сходство: {neg_similarities.std().item():.3f}")
-
-            if len(apt_pos) > 0:
-                separation = pos_similarities.mean().item() - neg_similarities.mean().item()
-                print(f"    separation: {separation:.3f}")
-    ot_analysis = analyze_model_with_ot(
+    ot_analysis = analyze_model_with_loader(
         model=model,
-        apt_pos=apt_pos,
-        smi_pos=smi_pos,
-        apt_neg=apt_neg,
-        smi_neg=smi_neg,
+        data_loader=test_loader,  # используем test_loader с правильными парами!
         device=device
     )
 
@@ -213,7 +186,7 @@ def main():
 
 
 
-    return model, history, test_results
+    return model, history, test_results, test_loader, device
 
 
 def plot_final_results(history):
@@ -367,8 +340,12 @@ def save_embeddings(model, apt_pos, smi_pos, apt_neg, smi_neg, device):
 
 
 if __name__ == '__main__':
-    model, history, test_results = main()
+    model, history, test_results, test_loader, device = main()
 
+    from decoder import full_pipeline, get_cluster_embeddings, get_negative_cluster_embeddings
+    import pandas as pd
+    import os
 
-
-
+    # ===== ПРОВЕРКА: ЕСЛИ ВЕСА УЖЕ СУЩЕСТВУЮТ =====
+    use_pretrained = False 
+    model_path = 'final_micro_model.pth'
