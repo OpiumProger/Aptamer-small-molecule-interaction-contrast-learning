@@ -10,12 +10,17 @@ warnings.filterwarnings('ignore')
 
 
 class PairDistanceAnalyzer:
+    """
+    Анализатор для пар (аптамер, молекула) на основе расстояний между ними.
+    """
 
     def __init__(self, pos_distances, neg_distances, pos_similarities=None, neg_similarities=None):
         """
         Параметры:
             pos_distances: array [N_pos] - расстояния для позитивных пар (1 - cosine_similarity)
             neg_distances: array [N_neg] - расстояния для негативных пар
+            pos_similarities: array [N_pos] - косинусные сходства для позитивных пар
+            neg_similarities: array [N_neg] - косинусные сходства для негативных пар
         """
         self.pos_distances = np.array(pos_distances).flatten()
         self.neg_distances = np.array(neg_distances).flatten()
@@ -136,7 +141,7 @@ class PairDistanceAnalyzer:
         распределений позитивных и негативных пар.
 
         Параметры:
-            method: 'quantile'  или 'overlap'
+            method: 'quantile' (рекомендуется) или 'overlap'
             pos_quantile: верхний квантиль для позитивных расстояний (по умолчанию 75%)
             neg_quantile: нижний квантиль для негативных расстояний (по умолчанию 25%)
         """
@@ -150,6 +155,7 @@ class PairDistanceAnalyzer:
             neg_lower = np.percentile(self.neg_distances, neg_quantile)
 
             # Зона неопределенности: где позитивные > pos_upper ИЛИ негативные < neg_lower
+            # Но правильнее: где распределения перекрываются наиболее сильно
             ambiguous_threshold_low = min(pos_upper, neg_lower)
             ambiguous_threshold_high = max(pos_upper, neg_lower)
 
@@ -385,45 +391,86 @@ class PairDistanceAnalyzer:
         return summary
 
 
-def get_pair_distances_from_model(model, apt_pos, smi_pos, apt_neg, smi_neg, device):
+def get_pair_distances_from_loader(model, data_loader, device):
     """
-    Извлекает расстояния между аптамерами и молекулами для позитивных и негативных пар.
+    Извлекает расстояния из DataLoader (где уже есть правильные позитивные и негативные пары)
     """
     model.eval()
 
+    all_pos_distances = []
+    all_neg_distances = []
+    all_pos_similarities = []
+    all_neg_similarities = []
+
     with torch.no_grad():
-        # Позитивные пары
-        apt_pos_tensor = torch.FloatTensor(apt_pos).to(device)
-        smi_pos_tensor = torch.FloatTensor(smi_pos).to(device)
+        for batch in data_loader:
+            anchor_smi = batch['anchor_smi'].to(device)
+            positive_apts = batch['positive_apts'].to(device)
+            negative_apts = batch['negative_apts'].to(device)
 
-        z_apt_pos = model.encode_aptamer(apt_pos_tensor)
-        z_smi_pos = model.encode_molecule(smi_pos_tensor)
+            # === ПОЗИТИВНЫЕ ПАРЫ ===
+            z_mol = model.encode_molecule(anchor_smi)
+            z_pos_apt = model.encode_aptamer(positive_apts)
 
-        # Косинусные сходства и расстояния для позитивных пар
-        pos_similarities = F.cosine_similarity(z_apt_pos, z_smi_pos, dim=1)
-        pos_distances = 1 - pos_similarities
+            pos_sim = F.cosine_similarity(z_mol, z_pos_apt, dim=1)
+            pos_dist = 1 - pos_sim
 
-        # Негативные пары
-        if len(apt_neg) > 0 and len(smi_neg) > 0:
-            apt_neg_tensor = torch.FloatTensor(apt_neg).to(device)
-            smi_neg_tensor = torch.FloatTensor(smi_neg).to(device)
+            all_pos_similarities.extend(pos_sim.cpu().numpy())
+            all_pos_distances.extend(pos_dist.cpu().numpy())
 
-            z_apt_neg = model.encode_aptamer(apt_neg_tensor)
-            z_smi_neg = model.encode_molecule(smi_neg_tensor)
+            # === НЕГАТИВНЫЕ ПАРЫ ===
+            B, K, D = negative_apts.shape
+            for i in range(B):
+                z_mol_i = z_mol[i:i + 1]
+                for j in range(K):
+                    z_neg_apt = model.encode_aptamer(negative_apts[i, j].unsqueeze(0))
+                    neg_sim = F.cosine_similarity(z_mol_i, z_neg_apt, dim=1)
+                    neg_dist = 1 - neg_sim
 
-            neg_similarities = F.cosine_similarity(z_apt_neg, z_smi_neg, dim=1)
-            neg_distances = 1 - neg_similarities
-        else:
-            neg_distances = np.array([])
-            neg_similarities = np.array([])
+                    all_neg_similarities.append(neg_sim.cpu().numpy()[0])
+                    all_neg_distances.append(neg_dist.cpu().numpy()[0])
 
-    # Конвертируем в numpy
-    pos_distances = pos_distances.cpu().numpy()
-    pos_similarities = pos_similarities.cpu().numpy()
-    neg_distances = neg_distances.cpu().numpy() if len(neg_distances) > 0 else np.array([])
-    neg_similarities = neg_similarities.cpu().numpy() if len(neg_similarities) > 0 else np.array([])
+    return (np.array(all_pos_distances), np.array(all_neg_distances),
+            np.array(all_pos_similarities), np.array(all_neg_similarities))
 
-    return pos_distances, neg_distances, pos_similarities, neg_similarities
+
+def analyze_model_with_loader(model, data_loader, device):
+    """
+    Анализ модели с использованием DataLoader (правильные пары)
+    """
+    print("\n" + "=" * 60)
+    print("PAIR DISTANCE ANALYSIS (from DataLoader)")
+    print("=" * 60)
+
+    print("\nExtracting pair distances from DataLoader...")
+    pos_distances, neg_distances, pos_similarities, neg_similarities = get_pair_distances_from_loader(
+        model, data_loader, device
+    )
+
+    print(f"  • Positive pairs: {len(pos_distances)}")
+    print(f"    - Mean distance: {pos_distances.mean():.4f}")
+    print(f"    - Mean similarity: {pos_similarities.mean():.4f}")
+    print(f"  • Negative pairs: {len(neg_distances)}")
+    print(f"    - Mean distance: {neg_distances.mean():.4f}")
+    print(f"    - Mean similarity: {neg_similarities.mean():.4f}")
+    print(f"  • Separation: {neg_distances.mean() - pos_distances.mean():.4f}")
+
+    # Создаем анализатор
+    analyzer = PairDistanceAnalyzer(pos_distances, neg_distances, pos_similarities, neg_similarities)
+
+    # Вычисляем метрики
+    ot_results = analyzer.compute_wasserstein_distance()
+    print(f"\n  Wasserstein Distance (W2): {ot_results['wasserstein_distance']:.4f}")
+
+    best_acc, best_threshold = analyzer.compute_accuracy_at_threshold()
+    print(f"  Theoretical best accuracy: {best_acc:.4f} ({best_acc * 100:.1f}%)")
+
+    # Визуализации
+    analyzer.create_distance_distribution_plot(save_path='pair_distance_distributions.png')
+
+    print(analyzer.get_summary())
+
+    return analyzer
 
 
 def analyze_model_pair_distances(model, apt_pos, smi_pos, apt_neg, smi_neg, device):
