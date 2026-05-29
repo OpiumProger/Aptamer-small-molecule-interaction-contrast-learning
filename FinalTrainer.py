@@ -16,12 +16,10 @@ class FinalTrainer:
         self.criterion = TemperatureScaledLoss(init_temperature=0.25)
 
         # Optimizer
-        self.optimizer = torch.optim.AdamW(
-            model.parameters(),
-            lr=1e-4,
-            weight_decay=5e-3
-        )
-
+        self.optimizer = torch.optim.AdamW([
+            {'params': self.model.parameters(), 'lr': 4e-4},
+            {'params': [self.criterion.log_temperature], 'lr': 1e-2}  # В 100 раз выше!
+        ], weight_decay=5e-3)
         self.scheduler = torch.optim.lr_scheduler.StepLR(
             self.optimizer, step_size=5, gamma=0.5
         )
@@ -55,12 +53,12 @@ class FinalTrainer:
         pbar = tqdm(self.train_loader, desc=f'Epoch {epoch} [Train]')
         for batch in pbar:
             # Move to device
-            anchor_apt = batch['anchor_apt'].to(self.device)
-            positive_smi = batch['positive_smi'].to(self.device)
-            negative_smis = batch['negative_smis'].to(self.device)
+            anchor_smi = batch['anchor_smi'].to(self.device)
+            positive_apts = batch['positive_apts'].to(self.device)
+            negative_apts = batch['negative_apts'].to(self.device)
 
             # Forward pass
-            outputs = self.model(anchor_apt, positive_smi, negative_smis)
+            outputs = self.model(anchor_smi, positive_apts, negative_apts)
 
             # Compute loss
             loss, metrics = self.criterion(
@@ -111,12 +109,12 @@ class FinalTrainer:
         with torch.no_grad():
             for batch in self.val_loader:
                 # Move to device
-                anchor_apt = batch['anchor_apt'].to(self.device)
-                positive_smi = batch['positive_smi'].to(self.device)
-                negative_smis = batch['negative_smis'].to(self.device)
+                anchor_smi = batch['anchor_smi'].to(self.device)
+                positive_apts = batch['positive_apts'].to(self.device)
+                negative_apts = batch['negative_apts'].to(self.device)
 
                 # Forward pass
-                outputs = self.model(anchor_apt, positive_smi, negative_smis)
+                outputs = self.model(anchor_smi, positive_apts, negative_apts)
 
                 # Compute loss
                 loss, metrics = self.criterion(
@@ -169,8 +167,8 @@ class FinalTrainer:
 
             # Print epoch summary
             print(f"\n  Epoch {epoch:03d}/{n_epochs}")
-            print(f"  Train Loss: {train_loss:.4f} | Acc: {train_acc:.3f} | Top3: {train_top3:.3f}")
-            print(f"  Val   Loss: {val_loss:.4f} | Acc: {val_acc:.3f} | Top3: {val_top3:.3f}")
+            print(f"  Train Loss: {train_loss:.6f} | Acc: {train_acc:.3f} | Top3: {train_top3:.3f}")
+            print(f"  Val   Loss: {val_loss:.6f} | Acc: {val_acc:.3f} | Top3: {val_top3:.3f}")
             print(f"  Gap: {gap:.3f} | Temp: {current_temp:.3f} | LR: {self.optimizer.param_groups[0]['lr']:.2e}")
 
             # Проверка на сильное переобучение
@@ -200,11 +198,11 @@ class FinalTrainer:
                 self.patience_counter += 1
                 print(f"No improvement: {self.patience_counter}/{self.patience}")
 
-            # Early stopping
-            if self.patience_counter >= self.patience:
-                print(f"\nEarly stopping at epoch {epoch}")
-                print(f"   Best Val Accuracy: {self.best_val_acc:.3f}")
-                break
+            # # Early stopping
+            # if self.patience_counter >= self.patience:
+            #     print(f"\nEarly stopping at epoch {epoch}")
+            #     print(f"   Best Val Accuracy: {self.best_val_acc:.3f}")
+            #     break
 
         # Берём лучшую модель
         if self.best_model_state is not None:
