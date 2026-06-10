@@ -1,3 +1,4 @@
+import os
 import torch
 import numpy as np
 from torch.utils.data import DataLoader
@@ -12,17 +13,18 @@ from DataPrepare import FinalContrastiveDataset
 from Model import MicroContrastiveModel
 from load_data_and_visual_data import load_data, analyze_results, visualize_embeddings_correct, visualize_embeddings_2d_simple
 
+DATA_FILE = "aptabench_with_embeddings_v2.csv"
+MODEL_CHECKPOINT = "final_micro_model.pth"
+USE_PRETRAINED = True  # False = переобучить contrastive + GRU с нуля
 
 
-
-
-def main():
+def main(train_contrastive: bool = True, model_checkpoint: str = MODEL_CHECKPOINT):
     print("=" * 70)
     print("CONTRASTIVE LEARNING WITH VISUALIZATION")
     print("=" * 70)
 
-    # Data load
-    data_file = "aptabench_with_embeddings.csv"
+    # Data load (used again in generation block for SMILES lookup)
+    data_file = DATA_FILE
     try:
         apt_pos, smi_pos, apt_neg, smi_neg, seq_dim, smi_dim = load_data(data_file)
     except Exception as e:
@@ -139,11 +141,21 @@ def main():
         device=device
     )
 
-    # training
-    print("\n Starting training...")
-    history = trainer.train(n_epochs=15, save_path='final_micro_model.pth')
-
-    plot_final_results(history)
+    history = {}
+    if (not train_contrastive) and os.path.exists(model_checkpoint):
+        print(f"\nLoading pretrained contrastive model from '{model_checkpoint}' (skip training)")
+        checkpoint = torch.load(model_checkpoint, map_location=device)
+        model.load_state_dict(checkpoint['model_state_dict'])
+    else:
+        print("\n Starting contrastive training...")
+        history = trainer.train(n_epochs=15, save_path=model_checkpoint)
+        plot_final_results(history)
+        try:
+            checkpoint = torch.load(model_checkpoint, map_location=device)
+            model.load_state_dict(checkpoint['model_state_dict'])
+            print(" Загружена лучшая модель после обучения")
+        except Exception:
+            print(" Используется текущая модель")
 
     print("\n Analyzing on test set...")
     test_results = analyze_results(model, test_loader, device)
@@ -154,17 +166,8 @@ def main():
     print(f"    Positive mean similarity: {test_results['pos_mean']:.3f}")
     print(f"    Negative mean similarity: {test_results['neg_mean']:.3f}")
 
-    plot_similarity_distributions(test_results)
-
-
-#Load the best model
-
-    try:
-        checkpoint = torch.load('final_micro_model.pth', map_location=device)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        print(" Загружена лучшая модель для визуализации")
-    except:
-        print(" Используется текущая модель")
+    if history:
+        plot_similarity_distributions(test_results)
 
     visualize_embeddings_correct(
         model=model,
@@ -340,12 +343,394 @@ def save_embeddings(model, apt_pos, smi_pos, apt_neg, smi_neg, device):
 
 
 if __name__ == '__main__':
-    model, history, test_results, test_loader, device = main()
+    import os
+    import pandas as pd
 
     from decoder import full_pipeline, get_cluster_embeddings, get_negative_cluster_embeddings
-    import pandas as pd
-    import os
 
-    # ===== ПРОВЕРКА: ЕСЛИ ВЕСА УЖЕ СУЩЕСТВУЮТ =====
-    use_pretrained = False 
-    model_path = 'final_micro_model.pth'
+    use_pretrained = USE_PRETRAINED
+    model, history, test_results, test_loader, device = main(
+        train_contrastive=not use_pretrained,
+        model_checkpoint=MODEL_CHECKPOINT,
+    )
+
+    # ===== ПРОВЕРКА: ЕСЛИ КЛАСТЕРИЗАЦИЯ УЖЕ ВЫПОЛНЕНА =====
+    cluster_files_exist = all([
+        os.path.exists('cluster_embeddings_768d.npy'),
+        os.path.exists('cluster_labels_768d.npy'),
+        os.path.exists('cluster_types.npy')
+    ])
+
+    if cluster_files_exist and use_pretrained:
+        print("\nЗагрузка сохранённых кластеров...")
+        embeddings_768d = np.load('cluster_embeddings_768d.npy')
+        cluster_labels = np.load('cluster_labels_768d.npy')
+        types = np.load('cluster_types.npy')
+        print(f"   Загружено {len(embeddings_768d)} эмбеддингов")
+
+        # Получаем негативный кластер
+        negative_embeddings, neg_cluster_id, neg_count = get_negative_cluster_embeddings(
+            embeddings_768d, cluster_labels, types
+        )
+        print(f"\nНегативный кластер {neg_cluster_id}: {neg_count} эмбеддингов")
+    else:
+        print("\nВыполнение кластеризации...")
+        # Запускаем пайплайн
+        decoder_auto, cluster_labels, embeddings_768d, types = full_pipeline(
+            model=model,
+            test_loader=test_loader,
+            device=device,
+            n_clusters=5,
+            train_decoder_flag=True
+        )
+
+        # Получаем негативный кластер
+        negative_embeddings, neg_cluster_id, neg_count = get_negative_cluster_embeddings(
+            embeddings_768d, cluster_labels, types
+        )
+
+        print(f"\nНегативный кластер {neg_cluster_id}: {neg_count} эмбеддингов")
+        print(f"   Shape: {negative_embeddings.shape}")
+
+    # ===== ПРОВЕРКА: ЕСЛИ УСЛОВНЫЙ ДЕКОДЕР УЖЕ ОБУЧЕН =====
+    conditional_decoder_path = 'best_conditional_decoder.pth'
+
+    # ===== СОБИРАЕМ ЭМБЕДДИНГИ МОЛЕКУЛ И ПАРЫ С SMILES =====
+    print("\nCollecting molecule embeddings and negative aptamer latents from test_dataset...")
+    model.eval()
+
+    # Загружаем тот же датасет, на котором обучалась contrastive-модель (smi_emb_* должны совпадать)
+    df = pd.read_csv(DATA_FILE, low_memory=False)
+
+    # Находим колонку с SMILES
+    smiles_col = None
+    for col in df.columns:
+        if 'smiles' in col.lower() or 'canonical_smiles' in col.lower():
+            smiles_col = col
+            break
+
+    if smiles_col is None:
+        print("  Warning: SMILES column not found!")
+        smiles_col = 'canonical_smiles'
+
+    smi_emb_cols = [col for col in df.columns if col.startswith('smi_emb_')]
+    if not smi_emb_cols:
+        raise ValueError("Не найдены колонки smi_emb_* в CSV")
+
+    def embedding_key(values, ndigits=6):
+        return tuple(np.asarray(values, dtype=np.float32).round(ndigits).tolist())
+
+    smi_to_smiles = {
+        embedding_key(row[smi_emb_cols].values): str(row[smiles_col])
+        for _, row in df.iterrows()
+    }
+
+    test_dataset = test_loader.dataset
+    generation_targets = []
+    global_negative_latents = []
+
+    with torch.no_grad():
+        for mol_idx, smi_tuple in enumerate(test_dataset.smis):
+            raw_mol = np.asarray(smi_tuple, dtype=np.float32)
+            raw_negatives = test_dataset.smi_to_neg.get(smi_tuple, [])
+            if len(raw_negatives) == 0:
+                continue
+
+            mol_tensor = torch.FloatTensor(raw_mol).unsqueeze(0).to(device)
+            mol_emb = model.encode_molecule(mol_tensor).cpu().numpy()[0]
+
+            neg_tensor = torch.FloatTensor(np.asarray(raw_negatives, dtype=np.float32)).to(device)
+            neg_latents = model.encode_aptamer(neg_tensor).cpu().numpy()
+
+            mol_smiles = smi_to_smiles.get(embedding_key(raw_mol), f"Unknown_SMILES_{mol_idx}")
+            generation_targets.append({
+                'mol_embedding': mol_emb,
+                'raw_smi_embedding': raw_mol,
+                'local_negative_latents': neg_latents,
+                'smiles': mol_smiles,
+            })
+            global_negative_latents.append(neg_latents)
+
+    if global_negative_latents:
+        global_negative_latents = np.vstack(global_negative_latents)
+    else:
+        global_negative_latents = np.empty((0, 768), dtype=np.float32)
+
+    print(f"  Целевых молекул с негативами: {len(generation_targets)}")
+    print(f"  Негативных latent-точек в общем пуле: {len(global_negative_latents)}")
+
+    # ===== ПОДГОТОВКА ДАННЫХ ДЛЯ GRU (768d mol + 768d apt latent → sequence) =====
+    from Embeddings import aptamer_encode
+    from GRU import (
+        ConditionalGRUDecoder,
+        build_aligned_training_pairs,
+        filter_generation_targets_by_separation,
+        generate_ranked_aptamers_for_molecule,
+        train_conditional_decoder,
+    )
+
+    print("\nBuilding aligned (molecule_emb, aptamer_emb, sequence) data for GRU...")
+    mol_embeddings_array, apt_embeddings_for_decoder, sequences = build_aligned_training_pairs(
+        df=df,
+        model=model,
+        device=device,
+        negative_only=True,
+    )
+
+    print(f"\nData for GRU decoder:")
+    print(f"   Aligned negative samples: {len(mol_embeddings_array)}")
+    print(f"   Molecule embeddings: {mol_embeddings_array.shape}")
+    print(f"   Aptamer latents (768d): {apt_embeddings_for_decoder.shape}")
+
+    # Общий пул negative latent: test negatives + чистый negative-кластер (768d)
+    if len(global_negative_latents) > 0 and len(negative_embeddings) > 0:
+        global_negative_pool = np.vstack([global_negative_latents, negative_embeddings])
+    elif len(negative_embeddings) > 0:
+        global_negative_pool = negative_embeddings
+    else:
+        global_negative_pool = global_negative_latents
+
+    print(
+        f"   Global negative pool for generation: {len(global_negative_pool)} "
+        f"(test={len(global_negative_latents)}, cluster={len(negative_embeddings)})"
+    )
+
+    # ===== ОБУЧЕНИЕ ИЛИ ЗАГРУЗКА GRU =====
+    conditional_decoder = ConditionalGRUDecoder(
+        mol_dim=768,
+        latent_dim=768,
+        hidden_dim=512,
+        max_len=50,
+        min_len=20,
+        num_layers=2,
+        dropout=0.3,
+    )
+
+    if use_pretrained and os.path.exists(conditional_decoder_path):
+        print(f"\nЗагрузка предобученного GRU из '{conditional_decoder_path}'")
+        try:
+            conditional_decoder.load_state_dict(
+                torch.load(conditional_decoder_path, map_location=device)
+            )
+            conditional_decoder = conditional_decoder.to(device)
+            conditional_decoder.eval()
+            print("   GRU decoder загружен успешно!")
+        except RuntimeError as e:
+            print(f"   Старые веса GRU несовместимы: {e}")
+            print("   Будет выполнено переобучение GRU")
+            use_pretrained = False
+
+    if not use_pretrained or not os.path.exists(conditional_decoder_path):
+        print("\n" + "=" * 70)
+        print("TRAINING GRU DECODER (768d Molecule + 768d Negative Latent → Aptamer)")
+        print("=" * 70)
+
+        conditional_decoder = train_conditional_decoder(
+            decoder=conditional_decoder,
+            mol_embeddings=mol_embeddings_array,
+            apt_embeddings=apt_embeddings_for_decoder,
+            sequences=sequences,
+            epochs=50,
+            batch_size=32,
+            lr=1e-3,
+            device=device,
+            scheduled_sampling_max=0.4,
+        )
+
+        torch.save(conditional_decoder.state_dict(), conditional_decoder_path)
+        print(f"GRU decoder сохранён в '{conditional_decoder_path}'")
+
+    # ГЕНЕРАЦИЯ NON-INTERACTING АПТАМЕРОВ ЧЕРЕЗ GRU + NEGATIVE LATENTS
+    # Настройки генерации (увеличивайте для одной мишени):
+    GEN_CONFIG = {
+        # None = все молекулы; иначе подстрока SMILES, напр. "Cn1c(=O)c2[nH]cnc2n(C)c1=O"
+        "target_smiles": None,
+        "min_contrastive_separation": 0.0,   # минимальный пол; top-K ниже важнее
+        "max_generation_targets": 10,        # брать top-N мишеней по contrastive_separation
+        "sequence_sim_filter": True,         # post-decode: keep only sequence_sim < positive_mean
+        "allow_relaxed_fallback": False,     # не сохранять кандидатов при пустом strict_pass
+        "n_latent_points": 128,
+        "samples_per_latent": 8,
+        "latent_jitter_copies": 2,
+        "latent_jitter_std": 0.10,
+        "diversity_threshold": 0.88,
+        "temperature": 1.0,
+        "top_k": 8,
+        "max_latent_similarity": 0.15,
+        "n_keep": 50,
+        "min_seq_len": 18,
+        "max_seq_len": 50,
+    }
+
+    n_targets_before_gate = len(generation_targets)
+    generation_targets, skipped_targets = filter_generation_targets_by_separation(
+        generation_targets=generation_targets,
+        df=df,
+        contrastive_model=model,
+        device=device,
+        min_separation=GEN_CONFIG["min_contrastive_separation"],
+        max_targets=GEN_CONFIG.get("max_generation_targets"),
+        smiles_col=smiles_col,
+    )
+    print(
+        f"\nMolecule gating (min separation={GEN_CONFIG['min_contrastive_separation']}, "
+        f"max_targets={GEN_CONFIG.get('max_generation_targets')}): "
+        f"kept {len(generation_targets)}/{n_targets_before_gate}"
+    )
+    if skipped_targets:
+        print(f"  Skipped molecules: {len(skipped_targets)}")
+        for smiles, separation, reason in skipped_targets[:5]:
+            sep_text = "n/a" if separation is None else f"{separation:.4f}"
+            print(f"    [{reason}] separation={sep_text} smiles={str(smiles)[:70]}")
+        if len(skipped_targets) > 5:
+            print(f"    ... and {len(skipped_targets) - 5} more")
+
+    if GEN_CONFIG["target_smiles"]:
+        needle = GEN_CONFIG["target_smiles"]
+        generation_targets = [
+            t for t in generation_targets if needle in t["smiles"]
+        ]
+        print(f"\nФильтр по мишени: '{needle[:60]}...' -> {len(generation_targets)} молекул(а)")
+
+    print("\n" + "=" * 70)
+    print("GENERATING NON-INTERACTING APTAMERS WITH GRU + NEGATIVE LATENTS")
+    print("=" * 70)
+    print(f"GEN_CONFIG: {GEN_CONFIG}")
+
+    max_latent_similarity = GEN_CONFIG["max_latent_similarity"]
+    n_keep = GEN_CONFIG["n_keep"]
+
+    with open('generated_pairs_molecule_aptamer.txt', 'w', encoding='utf-8') as f:
+        f.write("=" * 80 + "\n")
+        f.write("GRU GENERATED NON-INTERACTING APTAMERS (negative 768d latent seeds)\n")
+        f.write("=" * 80 + "\n\n")
+
+        generated_count = 0
+        generation_stats = []
+
+        for mol_counter, target in enumerate(generation_targets):
+            mol_emb = target['mol_embedding']
+            mol_smiles = target['smiles']
+            local_neg = target['local_negative_latents']
+
+            f.write(f"\n{'=' * 70}\n")
+            f.write(f"MOLECULE #{mol_counter}\n")
+            f.write(f"SMILES: {mol_smiles}\n")
+            f.write(f"{'=' * 70}\n")
+
+            print(f"\nМолекула #{mol_counter}: {mol_smiles[:80]}...")
+
+            candidates = generate_ranked_aptamers_for_molecule(
+                decoder=conditional_decoder,
+                mol_embedding=mol_emb,
+                local_negative_points=local_neg,
+                global_negative_points=global_negative_pool,
+                device=device,
+                n_latent_points=GEN_CONFIG["n_latent_points"],
+                samples_per_latent=GEN_CONFIG["samples_per_latent"],
+                temperature=GEN_CONFIG["temperature"],
+                top_k=GEN_CONFIG["top_k"],
+                max_similarity=max_latent_similarity,
+                diversity_threshold=GEN_CONFIG["diversity_threshold"],
+                latent_jitter_copies=GEN_CONFIG["latent_jitter_copies"],
+                latent_jitter_std=GEN_CONFIG["latent_jitter_std"],
+                min_seq_len=GEN_CONFIG["min_seq_len"],
+                max_seq_len=GEN_CONFIG["max_seq_len"],
+                contrastive_model=model,
+                aptamer_encode_fn=aptamer_encode,
+                raw_smi_embedding=target.get("raw_smi_embedding"),
+                baseline_positive_mean=target.get("positive_mean"),
+                use_sequence_sim_filter=GEN_CONFIG["sequence_sim_filter"],
+            )
+
+            strict_candidates = [
+                c for c in candidates if c['latent_similarity'] <= max_latent_similarity
+            ]
+            output_candidates = strict_candidates[:n_keep]
+            used_relaxed = False
+            if not output_candidates and GEN_CONFIG.get("allow_relaxed_fallback", False):
+                used_relaxed = True
+                output_candidates = candidates[:n_keep]
+
+            f.write(
+                f"\n  n_latent_points={GEN_CONFIG['n_latent_points']}, "
+                f"samples_per_latent={GEN_CONFIG['samples_per_latent']}, "
+                f"jitter_copies={GEN_CONFIG['latent_jitter_copies']}, "
+                f"total_candidates={len(candidates)}, "
+                f"strict_pass={len(strict_candidates)}, "
+                f"used_relaxed_fallback={used_relaxed}\n"
+            )
+            if target.get("positive_mean") is not None:
+                f.write(
+                    f"  baseline_positive_mean={target['positive_mean']:.4f}, "
+                    f"baseline_negative_mean={target.get('negative_mean', float('nan')):.4f}, "
+                    f"contrastive_separation={target.get('contrastive_separation', float('nan')):.4f}\n"
+                )
+            if candidates:
+                sims = [c['latent_similarity'] for c in candidates]
+                f.write(
+                    f"  latent_similarity: min={min(sims):.4f}, "
+                    f"mean={np.mean(sims):.4f}, max={max(sims):.4f}\n"
+                )
+                if any("sequence_sim" in c for c in candidates):
+                    seq_sims = [c["sequence_sim"] for c in candidates if "sequence_sim" in c]
+                    f.write(
+                        f"  sequence_sim: min={min(seq_sims):.4f}, "
+                        f"mean={np.mean(seq_sims):.4f}, max={max(seq_sims):.4f}, "
+                        f"pass_vs_positive_mean={sum(1 for s in seq_sims if s < target.get('positive_mean', 1.0))}/{len(seq_sims)}\n"
+                    )
+                    generation_stats.append({
+                        "molecule_index": mol_counter,
+                        "smiles": mol_smiles,
+                        "contrastive_separation": target.get("contrastive_separation"),
+                        "sequence_sim_min": float(min(seq_sims)),
+                        "sequence_sim_mean": float(np.mean(seq_sims)),
+                        "sequence_sim_max": float(max(seq_sims)),
+                        "n_candidates": len(candidates),
+                        "n_saved": len(output_candidates),
+                    })
+
+            if not output_candidates:
+                f.write("\n  No candidates after GRU generation.\n")
+                print("  Нет кандидатов после GRU-генерации")
+                continue
+
+            for i, candidate in enumerate(output_candidates):
+                new_aptamer = candidate['sequence']
+                relaxed = used_relaxed or candidate['latent_similarity'] > max_latent_similarity
+                f.write(f"\n  Aptamer #{i + 1}:\n")
+                f.write(f"  {new_aptamer}\n")
+                seq_sim_text = ""
+                if "sequence_sim" in candidate:
+                    seq_sim_text = f", sequence_sim={candidate['sequence_sim']:.4f}"
+                f.write(
+                    f"  latent_similarity={candidate['latent_similarity']:.4f}, "
+                    f"length={candidate['length']}, GC={candidate['gc']:.2f}, "
+                    f"relaxed={relaxed}{seq_sim_text}\n"
+                )
+
+                print(
+                    f"  Aptamer {i + 1}: {new_aptamer[:60]}... "
+                    f"(latent_sim={candidate['latent_similarity']:.4f}, "
+                    f"relaxed={relaxed}{seq_sim_text})"
+                )
+                generated_count += 1
+
+    print(f"\n" + "=" * 70)
+    print(f"Сгенерировано {generated_count} аптамеров для {len(generation_targets)} молекул")
+    print(f"Результаты сохранены в 'generated_pairs_molecule_aptamer.txt'")
+    if generation_stats:
+        print("\nGeneration sequence_sim summary by molecule:")
+        for row in generation_stats:
+            print(
+                f"  #{row['molecule_index']} sep={row['contrastive_separation']:.4f} "
+                f"seq_sim min/mean/max="
+                f"{row['sequence_sim_min']:.4f}/"
+                f"{row['sequence_sim_mean']:.4f}/"
+                f"{row['sequence_sim_max']:.4f} "
+                f"saved={row['n_saved']}/{row['n_candidates']}"
+            )
+        print(
+            f"  Overall mean sequence_sim: "
+            f"{np.mean([r['sequence_sim_mean'] for r in generation_stats]):.4f}"
+        )
