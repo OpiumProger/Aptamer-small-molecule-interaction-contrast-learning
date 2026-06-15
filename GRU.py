@@ -501,6 +501,194 @@ def select_negative_latent_points(mol_embedding, local_negative_points=None, glo
     return np.asarray(selected, dtype=np.float32), np.asarray(selected_scores, dtype=np.float32)
 
 
+DEFAULT_OVERUSED_PREFIXES = ("CTTACGAC", "GGGACGAC", "TTCAAATCT")
+
+
+def _max_kmer_repeat(seq, k=5):
+    """Максимальное число вхождений любого k-mer (включая перекрытия)."""
+    if len(seq) < k:
+        return 1
+    counts = {}
+    for i in range(len(seq) - k + 1):
+        mer = seq[i:i + k]
+        counts[mer] = counts.get(mer, 0) + 1
+    return max(counts.values()) if counts else 1
+
+
+def _max_homopolymer_run(seq):
+    if not seq:
+        return 0
+    run = 1
+    max_run = 1
+    for prev, cur in zip(seq, seq[1:]):
+        run = run + 1 if prev == cur else 1
+        max_run = max(max_run, run)
+    return max_run
+
+
+def compute_motif_penalty(
+    seq,
+    kmer_sizes=(5, 6),
+    max_kmer_repeat=2,
+    max_homopolymer=5,
+    overused_prefixes=DEFAULT_OVERUSED_PREFIXES,
+    prefix_len=8,
+):
+    """
+    Штраф за повторяющиеся мотивы. Чем выше penalty, тем хуже кандидат.
+    reject=True — жёстко отбраковать (слишком много повторов).
+    """
+    penalty = 0.0
+    details = {}
+
+    for k in kmer_sizes:
+        max_rep = _max_kmer_repeat(seq, k)
+        details[f"max_{k}mer_repeat"] = max_rep
+        if max_rep > max_kmer_repeat:
+            excess = max_rep - max_kmer_repeat
+            penalty += 0.15 * excess
+            if max_rep >= max_kmer_repeat + 2:
+                return penalty, True, details
+
+    hp = _max_homopolymer_run(seq)
+    details["max_homopolymer"] = hp
+    if hp > max_homopolymer:
+        penalty += 0.10 * (hp - max_homopolymer)
+        if hp > max_homopolymer + 2:
+            return penalty, True, details
+
+    seq_prefix = seq[:prefix_len]
+    for known in overused_prefixes:
+        if seq.startswith(known):
+            penalty += 0.12
+            details["overused_prefix"] = known
+            break
+        known_prefix = known[:prefix_len]
+        if len(seq_prefix) >= 6 and seq_prefix == known_prefix:
+            penalty += 0.08
+            details["overused_prefix_partial"] = known_prefix
+            break
+
+    return penalty, False, details
+
+
+def annotate_candidates_with_motif_penalty(
+    candidates,
+    kmer_sizes=(5, 6),
+    max_kmer_repeat=2,
+    max_homopolymer=5,
+    overused_prefixes=DEFAULT_OVERUSED_PREFIXES,
+    prefix_len=8,
+    motif_penalty_weight=0.15,
+    reject_high_motif_repeat=True,
+):
+    """Добавляет motif_penalty и composite_score к каждому кандидату."""
+    annotated = []
+    for candidate in candidates:
+        item = dict(candidate)
+        penalty, reject, details = compute_motif_penalty(
+            item["sequence"],
+            kmer_sizes=kmer_sizes,
+            max_kmer_repeat=max_kmer_repeat,
+            max_homopolymer=max_homopolymer,
+            overused_prefixes=overused_prefixes,
+            prefix_len=prefix_len,
+        )
+        item["motif_penalty"] = float(penalty)
+        item["motif_details"] = details
+        item["motif_reject"] = bool(reject and reject_high_motif_repeat)
+
+        base_score = item.get(
+            "latent_sim",
+            item.get("sequence_sim", item.get("latent_similarity", 0.0)),
+        )
+        item["composite_score"] = float(base_score) + motif_penalty_weight * penalty
+        annotated.append(item)
+    return annotated
+
+
+def rank_candidates_with_motif_penalty(
+    candidates,
+    motif_penalty_weight=0.15,
+    reject_high_motif_repeat=True,
+    kmer_sizes=(5, 6),
+    max_kmer_repeat=2,
+    max_homopolymer=5,
+    overused_prefixes=DEFAULT_OVERUSED_PREFIXES,
+    prefix_len=8,
+):
+    """Фильтрует по мотивам и сортирует: меньший composite_score = лучше."""
+    annotated = annotate_candidates_with_motif_penalty(
+        candidates,
+        kmer_sizes=kmer_sizes,
+        max_kmer_repeat=max_kmer_repeat,
+        max_homopolymer=max_homopolymer,
+        overused_prefixes=overused_prefixes,
+        prefix_len=prefix_len,
+        motif_penalty_weight=motif_penalty_weight,
+        reject_high_motif_repeat=reject_high_motif_repeat,
+    )
+    kept = [c for c in annotated if not c.get("motif_reject", False)]
+    kept.sort(key=lambda item: item.get("composite_score", item.get("latent_sim", 0.0)))
+    return kept
+
+
+def select_diverse_output_candidates(
+    candidates,
+    n_keep,
+    max_same_prefix=2,
+    prefix_len=8,
+    backfill_to_n_keep=True,
+):
+    """Ограничивает число последовательностей с одинаковым префиксом."""
+    selected = []
+    prefix_counts = {}
+    for candidate in candidates:
+        prefix = candidate["sequence"][:prefix_len]
+        if prefix_counts.get(prefix, 0) >= max_same_prefix:
+            continue
+        selected.append(candidate)
+        prefix_counts[prefix] = prefix_counts.get(prefix, 0) + 1
+        if len(selected) >= n_keep:
+            break
+
+    if backfill_to_n_keep and len(selected) < n_keep:
+        seen = {c["sequence"] for c in selected}
+        for candidate in candidates:
+            if candidate["sequence"] in seen:
+                continue
+            selected.append(candidate)
+            seen.add(candidate["sequence"])
+            if len(selected) >= n_keep:
+                break
+
+    return selected
+
+
+def select_top_candidates_for_tools(
+    candidates,
+    top_k=3,
+    max_motif_penalty=0.05,
+):
+    """
+    Top-K кандидатов для внешней валидации (RSAPred / Boltz).
+    Сначала diverse (motif_penalty <= max), иначе backfill из полного ранжированного пула.
+    """
+    if not candidates:
+        return []
+
+    ranked = sorted(
+        candidates,
+        key=lambda item: (
+            item.get("composite_score", item.get("latent_sim", item.get("latent_similarity", 0.0))),
+            item.get("motif_penalty", 0.0),
+        ),
+    )
+    diverse = [c for c in ranked if c.get("motif_penalty", 0.0) <= max_motif_penalty]
+    pool = diverse if len(diverse) >= top_k else ranked
+    return pool[:top_k]
+
+
 def passes_basic_aptamer_filters(seq, min_len=20, max_len=50, max_homopolymer=6, gc_range=(0.2, 0.8)):
     """Быстрые sanity-фильтры для сгенерированной DNA-последовательности."""
     if not seq or len(seq) < min_len or len(seq) > max_len:
@@ -525,10 +713,20 @@ def _resolve_smiles_column(df):
     return "canonical_smiles"
 
 
-def compute_molecule_baseline_sims(contrastive_model, df, smiles, device, smiles_col=None):
+def compute_molecule_baseline_sims(
+    contrastive_model,
+    df,
+    smiles,
+    device,
+    smiles_col=None,
+    global_negative_latents=None,
+):
     """
-    Per-molecule contrastive cosine sims using stored seq_emb/smi_emb from CSV.
-    Returns empty dict when the molecule has no positive/negative rows.
+    Per-molecule contrastive cosine sims.
+
+    Positive stats come from CSV rows with the same SMILES.
+    Negative stats use same-SMILES CSV negatives when available; otherwise
+    fall back to encoded global negative latents from the generation target.
     """
     seq_cols = [c for c in df.columns if c.startswith("seq_emb_")]
     smi_cols = [c for c in df.columns if c.startswith("smi_emb_")]
@@ -542,7 +740,7 @@ def compute_molecule_baseline_sims(contrastive_model, df, smiles, device, smiles
 
     pos_rows = subset[subset["label"] == 1]
     neg_rows = subset[subset["label"] == 0]
-    if pos_rows.empty or neg_rows.empty:
+    if pos_rows.empty:
         return {}
 
     smi_embedding = subset.iloc[0][smi_cols].to_numpy(dtype=np.float32)
@@ -552,17 +750,33 @@ def compute_molecule_baseline_sims(contrastive_model, df, smiles, device, smiles
         smi_z = contrastive_model.encode_molecule(smi_t)
 
         pos_t = torch.tensor(pos_rows[seq_cols].values.astype(np.float32), device=device)
-        neg_t = torch.tensor(neg_rows[seq_cols].values.astype(np.float32), device=device)
         pos_sims = F.cosine_similarity(
             smi_z.expand(len(pos_rows), -1),
             contrastive_model.encode_aptamer(pos_t),
             dim=-1,
         )
-        neg_sims = F.cosine_similarity(
-            smi_z.expand(len(neg_rows), -1),
-            contrastive_model.encode_aptamer(neg_t),
-            dim=-1,
-        )
+
+        negative_source = "csv_same_smiles"
+        if not neg_rows.empty:
+            neg_t = torch.tensor(neg_rows[seq_cols].values.astype(np.float32), device=device)
+            neg_sims = F.cosine_similarity(
+                smi_z.expand(len(neg_rows), -1),
+                contrastive_model.encode_aptamer(neg_t),
+                dim=-1,
+            )
+        elif global_negative_latents is not None and len(global_negative_latents) > 0:
+            neg_z = torch.tensor(
+                np.asarray(global_negative_latents, dtype=np.float32),
+                device=device,
+            )
+            neg_sims = F.cosine_similarity(
+                smi_z.expand(len(neg_z), -1),
+                neg_z,
+                dim=-1,
+            )
+            negative_source = "global_latent_pool"
+        else:
+            return {}
 
     positive_mean = float(pos_sims.mean().cpu())
     negative_mean = float(neg_sims.mean().cpu())
@@ -573,6 +787,7 @@ def compute_molecule_baseline_sims(contrastive_model, df, smiles, device, smiles
         "negative_min": float(neg_sims.min().cpu()),
         "negative_max": float(neg_sims.max().cpu()),
         "contrastive_separation": positive_mean - negative_mean,
+        "baseline_negative_source": negative_source,
     }
 
 
@@ -595,7 +810,12 @@ def enrich_generation_targets_with_baselines(
             continue
 
         baseline = compute_molecule_baseline_sims(
-            contrastive_model, df, smiles, device, smiles_col=smiles_col
+            contrastive_model,
+            df,
+            smiles,
+            device,
+            smiles_col=smiles_col,
+            global_negative_latents=target.get("local_negative_latents"),
         )
         if not baseline:
             skipped.append((smiles, None, "missing_baseline"))
@@ -632,6 +852,100 @@ def summarize_gating_thresholds(enriched_targets, thresholds=(0.02, 0.03, 0.05))
             print(f"  >= {threshold:.2f}: 0/{len(enriched_targets)} molecules")
 
 
+def _match_target_smiles(smiles, needle):
+    if not needle:
+        return False
+    return str(needle).strip().lower() in str(smiles).strip().lower()
+
+
+def build_generation_target_from_dataframe(
+    df,
+    target_smiles,
+    contrastive_model,
+    device,
+    global_negative_latents=None,
+    smiles_col=None,
+):
+    """
+    Собирает generation target из CSV, если молекула не попала в test split.
+    """
+    smiles_col = smiles_col or _resolve_smiles_column(df)
+    smi_emb_cols = [c for c in df.columns if c.startswith("smi_emb_")]
+    seq_emb_cols = [c for c in df.columns if c.startswith("seq_emb_")]
+    if not smi_emb_cols or not seq_emb_cols:
+        return None
+
+    work = df.copy()
+    work_smiles = work[smiles_col].astype(str)
+    exact_rows = work[work_smiles == str(target_smiles).strip()]
+    if exact_rows.empty:
+        exact_rows = work[
+            work_smiles.str.contains(str(target_smiles).strip(), case=False, na=False, regex=False)
+        ]
+    if exact_rows.empty:
+        return None
+
+    row = exact_rows.iloc[0]
+    smiles = str(row[smiles_col])
+    raw_mol = row[smi_emb_cols].to_numpy(dtype=np.float32)
+
+    with torch.no_grad():
+        mol_t = torch.tensor(raw_mol, dtype=torch.float32, device=device).unsqueeze(0)
+        mol_emb = contrastive_model.encode_molecule(mol_t).cpu().numpy()[0]
+
+        neg_rows = work[(work_smiles == smiles) & (work["label"] == 0)]
+        if not neg_rows.empty:
+            neg_t = torch.tensor(
+                neg_rows[seq_emb_cols].values.astype(np.float32),
+                dtype=torch.float32,
+                device=device,
+            )
+            local_neg = contrastive_model.encode_aptamer(neg_t).cpu().numpy()
+            neg_source = "csv_same_smiles"
+        elif global_negative_latents is not None and len(global_negative_latents) > 0:
+            sample_n = min(32, len(global_negative_latents))
+            local_neg = np.asarray(global_negative_latents[:sample_n], dtype=np.float32)
+            neg_source = "global_latent_pool"
+        else:
+            local_neg = np.empty((0, 768), dtype=np.float32)
+            neg_source = "none"
+
+    return {
+        "mol_embedding": mol_emb,
+        "raw_smi_embedding": raw_mol,
+        "local_negative_latents": local_neg,
+        "smiles": smiles,
+        "baseline_negative_source": neg_source,
+        "source": "dataframe_lookup",
+    }
+
+
+def filter_targets_by_smiles(generation_targets, target_smiles, fallback_needles=None):
+    """
+    Оставляет мишени, чей SMILES содержит target_smiles (или fallback-подстроки).
+    """
+    needles = []
+    if target_smiles:
+        needles.append(str(target_smiles).strip())
+    for item in fallback_needles or []:
+        item = str(item).strip()
+        if item and item not in needles:
+            needles.append(item)
+
+    if not needles:
+        return generation_targets, None
+
+    matched = []
+    used_needle = None
+    for needle in needles:
+        matched = [t for t in generation_targets if _match_target_smiles(t.get("smiles", ""), needle)]
+        if matched:
+            used_needle = needle
+            break
+
+    return matched, used_needle
+
+
 def filter_generation_targets_by_separation(
     generation_targets,
     df,
@@ -640,15 +954,104 @@ def filter_generation_targets_by_separation(
     min_separation=0.05,
     max_targets=None,
     smiles_col=None,
+    target_smiles=None,
+    target_smiles_fallbacks=None,
+    global_negative_latents=None,
 ):
     """
     Keep molecules with contrastive_separation >= min_separation, then take top-K
     by separation (best-separated targets first).
+
+    If target_smiles is set, matched molecules are selected from the full enriched
+    pool before top-K gating (so caffeine and other small targets are not dropped).
     """
     enriched, skipped = enrich_generation_targets_with_baselines(
         generation_targets, df, contrastive_model, device, smiles_col=smiles_col
     )
     summarize_gating_thresholds(enriched)
+
+    if target_smiles:
+        exact_target = str(target_smiles).strip()
+        matched, used_needle = filter_targets_by_smiles(
+            enriched,
+            target_smiles=exact_target,
+            fallback_needles=None,
+        )
+        if not matched:
+            built = build_generation_target_from_dataframe(
+                df=df,
+                target_smiles=exact_target,
+                contrastive_model=contrastive_model,
+                device=device,
+                global_negative_latents=global_negative_latents,
+                smiles_col=smiles_col,
+            )
+            if built is not None:
+                baseline = compute_molecule_baseline_sims(
+                    contrastive_model,
+                    df,
+                    built["smiles"],
+                    device,
+                    smiles_col=smiles_col,
+                    global_negative_latents=built.get("local_negative_latents"),
+                )
+                if baseline:
+                    built.update(baseline)
+                matched = [built]
+                used_needle = exact_target
+                print(
+                    f"\nTarget mode: molecule not in test split; "
+                    f"loaded from CSV lookup for '{exact_target[:60]}'"
+                )
+
+        if not matched and target_smiles_fallbacks:
+            matched, used_needle = filter_targets_by_smiles(
+                enriched,
+                target_smiles=None,
+                fallback_needles=target_smiles_fallbacks,
+            )
+            if matched and used_needle != exact_target:
+                print(
+                    f"\nWARNING: exact target '{exact_target[:60]}' not found. "
+                    f"Using fallback '{used_needle[:60]}' — this may be a different compound."
+                )
+
+        if matched:
+            matched.sort(
+                key=lambda t: t.get("contrastive_separation", float("-inf")),
+                reverse=True,
+            )
+            print(
+                f"\nTarget mode: matched {len(matched)} molecule(s) "
+                f"for '{used_needle[:60]}' (bypass top-K gating)"
+            )
+            for i, target in enumerate(matched[:5]):
+                print(
+                    f"  #{i} sep={target.get('contrastive_separation', float('nan')):.4f} "
+                    f"pos={target.get('positive_mean', float('nan')):.4f} "
+                    f"neg={target.get('negative_mean', float('nan')):.4f} "
+                    f"src={target.get('source', target.get('baseline_negative_source', 'test'))} "
+                    f"smiles={str(target['smiles'])[:70]}"
+                )
+            return matched, skipped
+
+        print(
+            f"\nTarget mode: no molecules matched target_smiles='{exact_target}' "
+            f"(fallbacks={target_smiles_fallbacks})"
+        )
+        near = sorted(
+            enriched,
+            key=lambda t: t.get("contrastive_separation", float("-inf")),
+            reverse=True,
+        )[:5]
+        if near:
+            print("  Closest molecules by separation in test set:")
+            for t in near:
+                print(
+                    f"    sep={t.get('contrastive_separation', float('nan')):.4f} "
+                    f"smiles={str(t.get('smiles', ''))[:70]}"
+                )
+        return [], skipped
 
     eligible = [
         t for t in enriched
@@ -668,6 +1071,17 @@ def filter_generation_targets_by_separation(
         if t.get("smiles") not in kept_smiles
     ]
 
+    csv_baselines = sum(
+        1 for t in enriched if t.get("baseline_negative_source") == "csv_same_smiles"
+    )
+    global_baselines = sum(
+        1 for t in enriched if t.get("baseline_negative_source") == "global_latent_pool"
+    )
+    print(
+        f"  Baseline sources: csv_same_smiles={csv_baselines}, "
+        f"global_latent_pool={global_baselines}, total={len(enriched)}"
+    )
+
     if kept:
         print(
             f"\nTop generation targets by contrastive_separation "
@@ -677,6 +1091,7 @@ def filter_generation_targets_by_separation(
             print(
                 f"  #{i} sep={target['contrastive_separation']:.4f} "
                 f"pos={target['positive_mean']:.4f} neg={target['negative_mean']:.4f} "
+                f"src={target.get('baseline_negative_source', 'n/a')} "
                 f"smiles={str(target['smiles'])[:70]}"
             )
         if len(kept) > 10:
@@ -692,13 +1107,12 @@ def score_and_filter_candidates_by_sequence_sim(
     device,
     aptamer_encode_fn,
     baseline_positive_mean=None,
+    max_latent_sim=0.0,
+    use_sequence_sim_filter=True,
 ):
     """
-    Encode generated sequences with GENA-LM, score in contrastive space, and keep
-    only candidates with sequence_sim below the molecule positive baseline.
-
-    raw_smi_embedding must be the stored ChemBERTa vector (smi_emb_*), not the
-    already contrastive-encoded molecule embedding.
+    Encode generated sequences with GENA-LM, score mol-apt cosine in contrastive
+    space, and filter by decoded latent_sim and optional positive baseline.
     """
     if not candidates:
         return candidates
@@ -718,11 +1132,21 @@ def score_and_filter_candidates_by_sequence_sim(
     filtered = []
     for candidate, sim in zip(candidates, sims):
         candidate = dict(candidate)
-        candidate["sequence_sim"] = float(sim)
-        if baseline_positive_mean is None or sim < baseline_positive_mean:
-            filtered.append(candidate)
+        decoded_sim = float(sim)
+        candidate["latent_sim"] = decoded_sim
+        candidate["sequence_sim"] = decoded_sim
 
-    filtered.sort(key=lambda item: item.get("sequence_sim", float("inf")))
+        if max_latent_sim is not None and decoded_sim > max_latent_sim:
+            continue
+        if (
+            use_sequence_sim_filter
+            and baseline_positive_mean is not None
+            and decoded_sim >= baseline_positive_mean
+        ):
+            continue
+        filtered.append(candidate)
+
+    filtered.sort(key=lambda item: item.get("latent_sim", float("inf")))
     return filtered
 
 
@@ -760,7 +1184,15 @@ def generate_ranked_aptamers_for_molecule(decoder, mol_embedding, local_negative
                                           aptamer_encode_fn=None,
                                           raw_smi_embedding=None,
                                           baseline_positive_mean=None,
-                                          use_sequence_sim_filter=True):
+                                          use_sequence_sim_filter=True,
+                                          max_latent_sim_for_decode=0.0,
+                                          motif_penalty_weight=0.15,
+                                          max_kmer_repeat=2,
+                                          motif_kmer_sizes=(5, 6),
+                                          max_homopolymer_motif=5,
+                                          reject_high_motif_repeat=True,
+                                          overused_prefixes=DEFAULT_OVERUSED_PREFIXES,
+                                          motif_prefix_len=8):
     """
     Генерирует кандидаты для целевой молекулы и возвращает их, отсортированными от
     наиболее вероятно не взаимодействующих к менее надёжным по latent cosine score.
@@ -819,11 +1251,9 @@ def generate_ranked_aptamers_for_molecule(decoder, mol_embedding, local_negative
             })
 
     if (
-        use_sequence_sim_filter
-        and contrastive_model is not None
+        contrastive_model is not None
         and aptamer_encode_fn is not None
         and raw_smi_embedding is not None
-        and baseline_positive_mean is not None
     ):
         candidates = score_and_filter_candidates_by_sequence_sim(
             candidates=candidates,
@@ -832,9 +1262,31 @@ def generate_ranked_aptamers_for_molecule(decoder, mol_embedding, local_negative
             device=device,
             aptamer_encode_fn=aptamer_encode_fn,
             baseline_positive_mean=baseline_positive_mean,
+            max_latent_sim=max_latent_sim_for_decode,
+            use_sequence_sim_filter=use_sequence_sim_filter,
+        )
+        candidates = rank_candidates_with_motif_penalty(
+            candidates,
+            motif_penalty_weight=motif_penalty_weight,
+            reject_high_motif_repeat=reject_high_motif_repeat,
+            kmer_sizes=motif_kmer_sizes,
+            max_kmer_repeat=max_kmer_repeat,
+            max_homopolymer=max_homopolymer_motif,
+            overused_prefixes=overused_prefixes,
+            prefix_len=motif_prefix_len,
         )
     else:
         candidates.sort(key=lambda item: item['latent_similarity'])
+        candidates = rank_candidates_with_motif_penalty(
+            candidates,
+            motif_penalty_weight=motif_penalty_weight,
+            reject_high_motif_repeat=reject_high_motif_repeat,
+            kmer_sizes=motif_kmer_sizes,
+            max_kmer_repeat=max_kmer_repeat,
+            max_homopolymer=max_homopolymer_motif,
+            overused_prefixes=overused_prefixes,
+            prefix_len=motif_prefix_len,
+        )
 
     return candidates
 
