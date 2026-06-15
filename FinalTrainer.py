@@ -1,6 +1,31 @@
 from Loss import TemperatureScaledLoss
 import torch
+import torch.nn.functional as F
 from tqdm import tqdm
+
+
+def _batch_separation_metrics(z_anchor, z_positive, z_negatives):
+    pos_sim = F.cosine_similarity(z_anchor, z_positive, dim=1)
+    batch_size, n_neg, _ = z_negatives.shape
+    neg_sims = []
+    overlaps = 0
+
+    for i in range(batch_size):
+        neg_i = F.cosine_similarity(
+            z_anchor[i:i + 1].expand(n_neg, -1),
+            z_negatives[i],
+        )
+        neg_sims.append(neg_i)
+        if neg_i.max() >= pos_sim[i]:
+            overlaps += 1
+
+    neg_sim = torch.cat(neg_sims)
+    return {
+        'separation': (pos_sim.mean() - neg_sim.mean()).item(),
+        'pos_mean': pos_sim.mean().item(),
+        'neg_mean': neg_sim.mean().item(),
+        'overlap_pct': overlaps / max(batch_size, 1),
+    }
 
 
 class FinalTrainer:
@@ -13,7 +38,11 @@ class FinalTrainer:
 
         # Loss function
 
-        self.criterion = TemperatureScaledLoss(init_temperature=0.25)
+        self.criterion = TemperatureScaledLoss(
+            init_temperature=0.25,
+            margin=0.15,
+            margin_weight=0.5,
+        )
 
         # Optimizer
         self.optimizer = torch.optim.AdamW([
@@ -28,14 +57,21 @@ class FinalTrainer:
             'train_loss': [], 'val_loss': [],
             'train_acc': [], 'val_acc': [],
             'train_top3': [], 'val_top3': [],
+            'train_separation': [], 'val_separation': [],
+            'train_overlap_pct': [], 'val_overlap_pct': [],
+            'val_score': [],
             'temperature': [],
-            'train_val_gap': []
+            'train_val_gap': [],
         }
 
         self.best_val_acc = 0
+        self.best_val_separation = float('-inf')
+        self.best_val_score = float('-inf')
+        self.overlap_penalty = 0.5
         self.patience_counter = 0
         self.patience = 5
         self.best_model_state = None
+        self.best_epoch = 0
 
     def compute_l2_reg(self):
         l2_reg = 0
@@ -48,6 +84,8 @@ class FinalTrainer:
         total_loss = 0
         total_acc = 0
         total_top3 = 0
+        total_separation = 0
+        total_overlap = 0
         n_batches = 0
 
         pbar = tqdm(self.train_loader, desc=f'Epoch {epoch} [Train]')
@@ -79,31 +117,42 @@ class FinalTrainer:
 
             self.optimizer.step()
 
-            # Update statistics
+            sep_metrics = _batch_separation_metrics(
+                outputs['z_anchor'],
+                outputs['z_positive'],
+                outputs['z_negatives'],
+            )
+
             total_loss += loss.item()
             total_acc += metrics['accuracy']
             total_top3 += metrics['top3_acc']
+            total_separation += sep_metrics['separation']
+            total_overlap += sep_metrics['overlap_pct']
             n_batches += 1
 
-            # Update progress bar
             pbar.set_postfix({
                 'loss': f"{loss.item():.4f}",
                 'acc': f"{metrics['accuracy']:.3f}",
-                'temp': f"{metrics['temperature']:.3f}"
+                'sep': f"{sep_metrics['separation']:.3f}",
+                'marg': f"{metrics.get('margin_loss', 0):.3f}",
+                'temp': f"{metrics['temperature']:.3f}",
             })
 
-        # Average metrics
         avg_loss = total_loss / n_batches if n_batches > 0 else 0
         avg_acc = total_acc / n_batches if n_batches > 0 else 0
         avg_top3 = total_top3 / n_batches if n_batches > 0 else 0
+        avg_separation = total_separation / n_batches if n_batches > 0 else 0
+        avg_overlap = total_overlap / n_batches if n_batches > 0 else 0
 
-        return avg_loss, avg_acc, avg_top3
+        return avg_loss, avg_acc, avg_top3, avg_separation, avg_overlap
 
     def validate(self):
         self.model.eval()
         total_loss = 0
         total_acc = 0
         total_top3 = 0
+        total_separation = 0
+        total_overlap = 0
         n_batches = 0
 
         with torch.no_grad():
@@ -123,28 +172,34 @@ class FinalTrainer:
                     outputs['z_negatives']
                 )
 
-                # Update statistics
+                sep_metrics = _batch_separation_metrics(
+                    outputs['z_anchor'],
+                    outputs['z_positive'],
+                    outputs['z_negatives'],
+                )
+
                 total_loss += loss.item()
                 total_acc += metrics['accuracy']
                 total_top3 += metrics['top3_acc']
+                total_separation += sep_metrics['separation']
+                total_overlap += sep_metrics['overlap_pct']
                 n_batches += 1
 
-        # Average metrics
         avg_loss = total_loss / n_batches if n_batches > 0 else 0
         avg_acc = total_acc / n_batches if n_batches > 0 else 0
         avg_top3 = total_top3 / n_batches if n_batches > 0 else 0
+        avg_separation = total_separation / n_batches if n_batches > 0 else 0
+        avg_overlap = total_overlap / n_batches if n_batches > 0 else 0
 
-        return avg_loss, avg_acc, avg_top3
+        return avg_loss, avg_acc, avg_top3, avg_separation, avg_overlap
 
     def train(self, n_epochs=15, save_path='final_best_model.pth'):
         print(f"\nStarting final training (max {n_epochs} epochs)...")
 
         for epoch in range(1, n_epochs + 1):
             # Train
-            train_loss, train_acc, train_top3 = self.train_epoch(epoch)
-
-            # Validate
-            val_loss, val_acc, val_top3 = self.validate()
+            train_loss, train_acc, train_top3, train_sep, train_overlap = self.train_epoch(epoch)
+            val_loss, val_acc, val_top3, val_sep, val_overlap = self.validate()
 
             # Update scheduler
             self.scheduler.step()
@@ -162,13 +217,19 @@ class FinalTrainer:
             self.history['val_acc'].append(val_acc)
             self.history['train_top3'].append(train_top3)
             self.history['val_top3'].append(val_top3)
+            self.history['train_separation'].append(train_sep)
+            self.history['val_separation'].append(val_sep)
+            self.history['train_overlap_pct'].append(train_overlap)
+            self.history['val_overlap_pct'].append(val_overlap)
+            val_score = val_sep - self.overlap_penalty * val_overlap
+            self.history['val_score'].append(val_score)
             self.history['temperature'].append(current_temp)
             self.history['train_val_gap'].append(gap)
 
-            # Print epoch summary
             print(f"\n  Epoch {epoch:03d}/{n_epochs}")
-            print(f"  Train Loss: {train_loss:.6f} | Acc: {train_acc:.3f} | Top3: {train_top3:.3f}")
-            print(f"  Val   Loss: {val_loss:.6f} | Acc: {val_acc:.3f} | Top3: {val_top3:.3f}")
+            print(f"  Train Loss: {train_loss:.6f} | Acc: {train_acc:.3f} | Sep: {train_sep:.3f} | Overlap: {train_overlap:.1%}")
+            print(f"  Val   Loss: {val_loss:.6f} | Acc: {val_acc:.3f} | Sep: {val_sep:.3f} | Overlap: {val_overlap:.1%}")
+            print(f"  Val score (sep - {self.overlap_penalty}*overlap): {val_score:.3f}")
             print(f"  Gap: {gap:.3f} | Temp: {current_temp:.3f} | LR: {self.optimizer.param_groups[0]['lr']:.2e}")
 
             # Проверка на сильное переобучение
@@ -176,9 +237,12 @@ class FinalTrainer:
                 print(f"CRITICAL OVERFITTING! Stopping...")
                 break
 
-            # Save best model
-            if val_acc > self.best_val_acc:
+            improved = val_score > self.best_val_score
+            if improved:
+                self.best_val_score = val_score
+                self.best_val_separation = val_sep
                 self.best_val_acc = val_acc
+                self.best_epoch = epoch
                 self.patience_counter = 0
                 self.best_model_state = self.model.state_dict().copy()
 
@@ -187,28 +251,39 @@ class FinalTrainer:
                     'model_state_dict': self.model.state_dict(),
                     'optimizer_state_dict': self.optimizer.state_dict(),
                     'val_acc': val_acc,
+                    'val_separation': val_sep,
+                    'val_overlap_pct': val_overlap,
+                    'val_score': val_score,
                     'val_top3': val_top3,
                     'train_acc': train_acc,
                     'temperature': current_temp,
-                    'history': self.history
+                    'history': self.history,
                 }, save_path)
 
-                print(f"Saved best model (Val Acc: {val_acc:.3f})")
+                print(
+                    f"Saved best model (Val score: {val_score:.3f}, "
+                    f"Sep: {val_sep:.3f}, Overlap: {val_overlap:.1%}, Acc: {val_acc:.3f})"
+                )
             else:
                 self.patience_counter += 1
                 print(f"No improvement: {self.patience_counter}/{self.patience}")
 
-            # # Early stopping
-            # if self.patience_counter >= self.patience:
-            #     print(f"\nEarly stopping at epoch {epoch}")
-            #     print(f"   Best Val Accuracy: {self.best_val_acc:.3f}")
-            #     break
+            if self.patience_counter >= self.patience:
+                print(f"\nEarly stopping at epoch {epoch}")
+                print(f"   Best epoch: {self.best_epoch}")
+                print(f"   Best Val score: {self.best_val_score:.3f}")
+                print(f"   Best Val separation: {self.best_val_separation:.3f}")
+                print(f"   Best Val accuracy: {self.best_val_acc:.3f}")
+                break
 
         # Берём лучшую модель
         if self.best_model_state is not None:
             self.model.load_state_dict(self.best_model_state)
 
         print(f"\nTraining completed!")
+        print(f"   Best epoch: {self.best_epoch}")
+        print(f"   Best validation score: {self.best_val_score:.3f}")
+        print(f"   Best validation separation: {self.best_val_separation:.3f}")
         print(f"   Best validation accuracy: {self.best_val_acc:.3f}")
         print(f"   Final train-val gap: {self.history['train_val_gap'][-1]:.3f}")
 
