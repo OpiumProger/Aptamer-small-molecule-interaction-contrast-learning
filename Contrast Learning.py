@@ -9,13 +9,13 @@ import warnings
 warnings.filterwarnings('ignore')
 
 from FinalTrainer import FinalTrainer
-from DataPrepare import FinalContrastiveDataset
+from DataPrepare import FinalContrastiveDataset, molecule_disjoint_split, DEFAULT_NEGATIVE_RATIO
 from Model import MicroContrastiveModel
 from load_data_and_visual_data import load_data, analyze_results, visualize_embeddings_correct, visualize_embeddings_2d_simple
 
 DATA_FILE = "aptabench_with_embeddings_v2.csv"
 MODEL_CHECKPOINT = "final_micro_model.pth"
-USE_PRETRAINED = True  # False = переобучить contrastive + GRU с нуля
+USE_PRETRAINED = False  # False = заново обучить contrastive + GRU; True = загрузить готовые веса
 
 
 def main(train_contrastive: bool = True, model_checkpoint: str = MODEL_CHECKPOINT):
@@ -26,64 +26,62 @@ def main(train_contrastive: bool = True, model_checkpoint: str = MODEL_CHECKPOIN
     # Data load (used again in generation block for SMILES lookup)
     data_file = DATA_FILE
     try:
-        apt_pos, smi_pos, apt_neg, smi_neg, seq_dim, smi_dim = load_data(data_file)
+        apt_pos, smi_pos, apt_neg, smi_neg, seq_dim, smi_dim, mol_keys_pos, mol_keys_neg = load_data(data_file)
     except Exception as e:
         print(f" Error loading data: {e}")
         return
 
+    import pandas as pd
+
     np.random.seed(42)
+    df = pd.read_csv(data_file, low_memory=False)
 
-    # Разделяем ПОЗИТИВНЫЕ пары
+    (
+        train_pos_idx, val_pos_idx, test_pos_idx,
+        train_neg_idx, val_neg_idx, test_neg_idx,
+        split_stats,
+    ) = molecule_disjoint_split(df, seed=42)
+
     n_pos = len(smi_pos)
-    pos_indices = np.random.permutation(n_pos)
-
-    train_pos_size = int(0.7 * n_pos)
-    val_pos_size = int(0.15 * n_pos)
-
-    train_pos_idx = pos_indices[:train_pos_size]
-    val_pos_idx = pos_indices[train_pos_size:train_pos_size + val_pos_size]
-    test_pos_idx = pos_indices[train_pos_size + val_pos_size:]
-
-    # Разделяем НЕГАТИВНЫЕ пары (отдельно!)
     n_neg = len(smi_neg)
-    neg_indices = np.random.permutation(n_neg)
 
-    train_neg_size = int(0.7 * n_neg)
-    val_neg_size = int(0.15 * n_neg)
-
-    train_neg_idx = neg_indices[:train_neg_size]
-    val_neg_idx = neg_indices[train_neg_size:train_neg_size + val_neg_size]
-    test_neg_idx = neg_indices[train_neg_size + val_neg_size:]
-
-    print(f"\nComplete pair-based split (positives AND negatives separated):")
+    print("\nMolecule-disjoint split (by canonical_smiles):")
+    print(f"  Molecules: train={split_stats['train_molecules']}, val={split_stats['val_molecules']}, test={split_stats['test_molecules']}")
     print(f"  Total positive pairs: {n_pos}")
-    print(f"    Train pos: {len(train_pos_idx)}")
-    print(f"    Val pos: {len(val_pos_idx)}")
-    print(f"    Test pos: {len(test_pos_idx)}")
+    print(f"    Train pos: {split_stats['train_pos']}")
+    print(f"    Val pos: {split_stats['val_pos']}")
+    print(f"    Test pos: {split_stats['test_pos']}")
     print(f"  Total negative pairs: {n_neg}")
-    print(f"    Train neg: {len(train_neg_idx)}")
-    print(f"    Val neg: {len(val_neg_idx)}")
-    print(f"    Test neg: {len(test_neg_idx)}")
+    print(f"    Train neg: {split_stats['train_neg']}")
+    print(f"    Val neg: {split_stats['val_neg']}")
+    print(f"    Test neg: {split_stats['test_neg']}")
+    print(f"  Negatives per sample: {DEFAULT_NEGATIVE_RATIO} (4 same-mol + 8 semi-hard + 4 random)")
 
     train_dataset = FinalContrastiveDataset(
         apt_pos[train_pos_idx],
         smi_pos[train_pos_idx],
         apt_neg[train_neg_idx],
-        smi_neg[train_neg_idx]
+        smi_neg[train_neg_idx],
+        mol_keys_pos[train_pos_idx],
+        mol_keys_neg[train_neg_idx],
     )
 
     val_dataset = FinalContrastiveDataset(
         apt_pos[val_pos_idx],
         smi_pos[val_pos_idx],
         apt_neg[val_neg_idx],
-        smi_neg[val_neg_idx]
+        smi_neg[val_neg_idx],
+        mol_keys_pos[val_pos_idx],
+        mol_keys_neg[val_neg_idx],
     )
 
     test_dataset = FinalContrastiveDataset(
         apt_pos[test_pos_idx],
         smi_pos[test_pos_idx],
         apt_neg[test_neg_idx],
-        smi_neg[test_neg_idx]
+        smi_neg[test_neg_idx],
+        mol_keys_pos[test_pos_idx],
+        mol_keys_neg[test_neg_idx],
     )
 
     # DataLoaders
@@ -148,7 +146,7 @@ def main(train_contrastive: bool = True, model_checkpoint: str = MODEL_CHECKPOIN
         model.load_state_dict(checkpoint['model_state_dict'])
     else:
         print("\n Starting contrastive training...")
-        history = trainer.train(n_epochs=15, save_path=model_checkpoint)
+        history = trainer.train(n_epochs=30, save_path=model_checkpoint)
         plot_final_results(history)
         try:
             checkpoint = torch.load(model_checkpoint, map_location=device)
@@ -163,6 +161,10 @@ def main(train_contrastive: bool = True, model_checkpoint: str = MODEL_CHECKPOIN
     print(f"\nFINAL TEST RESULTS:")
     print(f"    Accuracy: {test_results['accuracy']:.3f}")
     print(f"    Separation: {test_results['separation']:.3f}")
+    print(f"    Overlap (neg >= pos): {test_results['overlap_pct']:.1%}")
+    print(f"    ROC-AUC (global): {test_results['roc_auc']:.3f}")
+    print(f"    PR-AUC (global): {test_results['pr_auc']:.3f}")
+    print(f"    ROC-AUC (pair-level mean): {test_results['pair_roc_auc']:.3f}")
     print(f"    Positive mean similarity: {test_results['pos_mean']:.3f}")
     print(f"    Negative mean similarity: {test_results['neg_mean']:.3f}")
 
@@ -214,23 +216,34 @@ def plot_final_results(history):
     axes[0, 1].legend()
     axes[0, 1].grid(True, alpha=0.3)
 
-    # Top-3 Accuracy
-    axes[0, 2].plot(history['train_top3'], label='Train', linewidth=2, marker='o', markersize=4)
-    axes[0, 2].plot(history['val_top3'], label='Val', linewidth=2, marker='s', markersize=4)
-    axes[0, 2].set_xlabel('Epoch')
-    axes[0, 2].set_ylabel('Top-3 Accuracy')
-    axes[0, 2].set_title('Top-3 Accuracy')
-    axes[0, 2].legend()
-    axes[0, 2].grid(True, alpha=0.3)
+    if 'train_separation' in history:
+        axes[0, 2].plot(history['train_separation'], label='Train', linewidth=2, marker='o', markersize=4)
+        axes[0, 2].plot(history['val_separation'], label='Val', linewidth=2, marker='s', markersize=4)
+        axes[0, 2].set_xlabel('Epoch')
+        axes[0, 2].set_ylabel('Separation')
+        axes[0, 2].set_title('Latent Separation (pos - neg)')
+        axes[0, 2].legend()
+        axes[0, 2].grid(True, alpha=0.3)
+    else:
+        axes[0, 2].plot(history['train_top3'], label='Train', linewidth=2, marker='o', markersize=4)
+        axes[0, 2].plot(history['val_top3'], label='Val', linewidth=2, marker='s', markersize=4)
+        axes[0, 2].set_title('Top-3 Accuracy')
+        axes[0, 2].legend()
+        axes[0, 2].grid(True, alpha=0.3)
 
-    # Temperature
-    axes[1, 0].plot(history['temperature'], label='Temperature', linewidth=2, color='red', marker='o', markersize=4)
-    axes[1, 0].set_xlabel('Epoch')
-    axes[1, 0].set_ylabel('Temperature')
-    axes[1, 0].set_title('Temperature during training')
-    axes[1, 0].grid(True, alpha=0.3)
+    if 'val_overlap_pct' in history:
+        axes[1, 0].plot(history['train_overlap_pct'], label='Train', linewidth=2, marker='o', markersize=4)
+        axes[1, 0].plot(history['val_overlap_pct'], label='Val', linewidth=2, marker='s', markersize=4)
+        axes[1, 0].set_xlabel('Epoch')
+        axes[1, 0].set_ylabel('Overlap fraction')
+        axes[1, 0].set_title('Neg >= Pos overlap')
+        axes[1, 0].legend()
+        axes[1, 0].grid(True, alpha=0.3)
+    else:
+        axes[1, 0].plot(history['temperature'], label='Temperature', linewidth=2, color='red', marker='o', markersize=4)
+        axes[1, 0].set_title('Temperature during training')
+        axes[1, 0].grid(True, alpha=0.3)
 
-    # Train-Val Gap
     axes[1, 1].plot(history['train_val_gap'], label='Gap', linewidth=2, color='orange', marker='o', markersize=4)
     axes[1, 1].axhline(y=0.3, color='red', linestyle='--', alpha=0.5, label='Critical (0.3)')
     axes[1, 1].axhline(y=0.2, color='orange', linestyle='--', alpha=0.5, label='Warning (0.2)')
@@ -246,12 +259,18 @@ def plot_final_results(history):
     best_val_acc = max(history['val_acc'])
     best_train_acc = max(history['train_acc'])
     final_gap = history['train_val_gap'][-1]
+    best_val_sep = max(history.get('val_separation', [0]))
+    best_val_score = max(history.get('val_score', [0]))
+    final_overlap = history.get('val_overlap_pct', [0])[-1] if history.get('val_overlap_pct') else 0
 
     summary_text = (
         f"Final Results:\n\n"
-        f"Best Validation: {best_val_acc:.3f}\n"
-        f"Best Training: {best_train_acc:.3f}\n"
-        f"Final Gap: {final_gap:.3f}\n\n"
+        f"Best Val score: {best_val_score:.3f}\n"
+        f"Best Val Sep: {best_val_sep:.3f}\n"
+        f"Best Val Acc: {best_val_acc:.3f}\n"
+        f"Best Train Acc: {best_train_acc:.3f}\n"
+        f"Final Gap: {final_gap:.3f}\n"
+        f"Val Overlap: {final_overlap:.1%}\n\n"
     )
 
     axes[1, 2].text(0.5, 0.5, summary_text,
@@ -346,7 +365,7 @@ if __name__ == '__main__':
     import os
     import pandas as pd
 
-    from decoder import full_pipeline, get_cluster_embeddings, get_negative_cluster_embeddings
+    from decoder import full_pipeline, get_negative_cluster_embeddings
 
     use_pretrained = USE_PRETRAINED
     model, history, test_results, test_loader, device = main(
@@ -376,12 +395,11 @@ if __name__ == '__main__':
     else:
         print("\nВыполнение кластеризации...")
         # Запускаем пайплайн
-        decoder_auto, cluster_labels, embeddings_768d, types = full_pipeline(
+        cluster_labels, embeddings_768d, types = full_pipeline(
             model=model,
             test_loader=test_loader,
             device=device,
             n_clusters=5,
-            train_decoder_flag=True
         )
 
         # Получаем негативный кластер
@@ -430,9 +448,9 @@ if __name__ == '__main__':
     global_negative_latents = []
 
     with torch.no_grad():
-        for mol_idx, smi_tuple in enumerate(test_dataset.smis):
-            raw_mol = np.asarray(smi_tuple, dtype=np.float32)
-            raw_negatives = test_dataset.smi_to_neg.get(smi_tuple, [])
+        for mol_idx, mol_key in enumerate(test_dataset.smis):
+            raw_mol = test_dataset.key_to_smi[mol_key]
+            raw_negatives = test_dataset.get_negatives_for_molecule(mol_key)
             if len(raw_negatives) == 0:
                 continue
 
@@ -442,7 +460,12 @@ if __name__ == '__main__':
             neg_tensor = torch.FloatTensor(np.asarray(raw_negatives, dtype=np.float32)).to(device)
             neg_latents = model.encode_aptamer(neg_tensor).cpu().numpy()
 
-            mol_smiles = smi_to_smiles.get(embedding_key(raw_mol), f"Unknown_SMILES_{mol_idx}")
+            if isinstance(mol_key, str):
+                mol_smiles = mol_key
+            else:
+                mol_smiles = smi_to_smiles.get(
+                    embedding_key(raw_mol), f"Unknown_SMILES_{mol_idx}"
+                )
             generation_targets.append({
                 'mol_embedding': mol_emb,
                 'raw_smi_embedding': raw_mol,
@@ -466,6 +489,8 @@ if __name__ == '__main__':
         build_aligned_training_pairs,
         filter_generation_targets_by_separation,
         generate_ranked_aptamers_for_molecule,
+        select_diverse_output_candidates,
+        select_top_candidates_for_tools,
         train_conditional_decoder,
     )
 
@@ -541,14 +566,16 @@ if __name__ == '__main__':
         print(f"GRU decoder сохранён в '{conditional_decoder_path}'")
 
     # ГЕНЕРАЦИЯ NON-INTERACTING АПТАМЕРОВ ЧЕРЕЗ GRU + NEGATIVE LATENTS
-    # Настройки генерации (увеличивайте для одной мишени):
+    # Режим по умолчанию: молекулы из test split датасета (top-K по contrastive_separation).
+    # Для одной мишени задайте target_smiles = подстрока SMILES из CSV.
     GEN_CONFIG = {
-        # None = все молекулы; иначе подстрока SMILES, напр. "Cn1c(=O)c2[nH]cnc2n(C)c1=O"
         "target_smiles": None,
-        "min_contrastive_separation": 0.0,   # минимальный пол; top-K ниже важнее
-        "max_generation_targets": 10,        # брать top-N мишеней по contrastive_separation
-        "sequence_sim_filter": True,         # post-decode: keep only sequence_sim < positive_mean
-        "allow_relaxed_fallback": False,     # не сохранять кандидатов при пустом strict_pass
+        "target_smiles_fallbacks": [],
+        "min_contrastive_separation": 0.05,
+        "max_generation_targets": 10,
+        "sequence_sim_filter": True,
+        "max_latent_sim_for_decode": -0.10,
+        "allow_relaxed_fallback": False,
         "n_latent_points": 128,
         "samples_per_latent": 8,
         "latent_jitter_copies": 2,
@@ -558,8 +585,18 @@ if __name__ == '__main__':
         "top_k": 8,
         "max_latent_similarity": 0.15,
         "n_keep": 50,
+        "output_top_k_for_tools": 3,
+        "max_motif_penalty_for_tools": 0.05,
         "min_seq_len": 18,
         "max_seq_len": 50,
+        "motif_penalty_weight": 0.15,
+        "max_kmer_repeat": 2,
+        "motif_kmer_sizes": (5, 6),
+        "max_homopolymer_motif": 5,
+        "reject_high_motif_repeat": True,
+        "max_same_prefix": 2,
+        "motif_prefix_len": 8,
+        "resume_from_molecule_index": 0,
     }
 
     n_targets_before_gate = len(generation_targets)
@@ -571,10 +608,20 @@ if __name__ == '__main__':
         min_separation=GEN_CONFIG["min_contrastive_separation"],
         max_targets=GEN_CONFIG.get("max_generation_targets"),
         smiles_col=smiles_col,
+        target_smiles=GEN_CONFIG.get("target_smiles"),
+        target_smiles_fallbacks=GEN_CONFIG.get("target_smiles_fallbacks"),
+        global_negative_latents=global_negative_latents,
+    )
+    gate_label = (
+        f"target='{GEN_CONFIG['target_smiles'][:40]}...'"
+        if GEN_CONFIG.get("target_smiles")
+        else (
+            f"min separation={GEN_CONFIG['min_contrastive_separation']}, "
+            f"max_targets={GEN_CONFIG.get('max_generation_targets')}"
+        )
     )
     print(
-        f"\nMolecule gating (min separation={GEN_CONFIG['min_contrastive_separation']}, "
-        f"max_targets={GEN_CONFIG.get('max_generation_targets')}): "
+        f"\nMolecule gating ({gate_label}): "
         f"kept {len(generation_targets)}/{n_targets_before_gate}"
     )
     if skipped_targets:
@@ -585,30 +632,43 @@ if __name__ == '__main__':
         if len(skipped_targets) > 5:
             print(f"    ... and {len(skipped_targets) - 5} more")
 
-    if GEN_CONFIG["target_smiles"]:
-        needle = GEN_CONFIG["target_smiles"]
-        generation_targets = [
-            t for t in generation_targets if needle in t["smiles"]
-        ]
-        print(f"\nФильтр по мишени: '{needle[:60]}...' -> {len(generation_targets)} молекул(а)")
-
     print("\n" + "=" * 70)
     print("GENERATING NON-INTERACTING APTAMERS WITH GRU + NEGATIVE LATENTS")
     print("=" * 70)
+    if GEN_CONFIG.get("target_smiles"):
+        print(f"Mode: single target SMILES")
+    else:
+        print(
+            f"Mode: dataset molecules from test split "
+            f"(top {GEN_CONFIG.get('max_generation_targets') or 'all'} by contrastive_separation)"
+        )
     print(f"GEN_CONFIG: {GEN_CONFIG}")
 
     max_latent_similarity = GEN_CONFIG["max_latent_similarity"]
     n_keep = GEN_CONFIG["n_keep"]
+    pair_rows = []
+    top_tool_rows = []
+    resume_from = int(GEN_CONFIG.get("resume_from_molecule_index") or 0)
+    top_k_tools = int(GEN_CONFIG.get("output_top_k_for_tools", 3))
 
-    with open('generated_pairs_molecule_aptamer.txt', 'w', encoding='utf-8') as f:
-        f.write("=" * 80 + "\n")
-        f.write("GRU GENERATED NON-INTERACTING APTAMERS (negative 768d latent seeds)\n")
-        f.write("=" * 80 + "\n\n")
+    print("Preloading GENA-LM encoder (cached for all molecules)...")
+    aptamer_encode(["ACGTACGTACGTACGTACGTACGT"], batch_size=1, device=str(device))
+
+    file_mode = "a" if resume_from > 0 else "w"
+    with open('generated_pairs_molecule_aptamer.txt', file_mode, encoding='utf-8') as f:
+        if resume_from == 0:
+            f.write("=" * 80 + "\n")
+            f.write("GRU GENERATED NON-INTERACTING APTAMERS (negative 768d latent seeds)\n")
+            f.write("=" * 80 + "\n\n")
+        else:
+            print(f"Resuming generation from molecule #{resume_from} (append mode)")
 
         generated_count = 0
         generation_stats = []
 
         for mol_counter, target in enumerate(generation_targets):
+            if mol_counter < resume_from:
+                continue
             mol_emb = target['mol_embedding']
             mol_smiles = target['smiles']
             local_neg = target['local_negative_latents']
@@ -641,16 +701,36 @@ if __name__ == '__main__':
                 raw_smi_embedding=target.get("raw_smi_embedding"),
                 baseline_positive_mean=target.get("positive_mean"),
                 use_sequence_sim_filter=GEN_CONFIG["sequence_sim_filter"],
+                max_latent_sim_for_decode=GEN_CONFIG.get("max_latent_sim_for_decode", 0.0),
+                motif_penalty_weight=GEN_CONFIG.get("motif_penalty_weight", 0.15),
+                max_kmer_repeat=GEN_CONFIG.get("max_kmer_repeat", 2),
+                motif_kmer_sizes=tuple(GEN_CONFIG.get("motif_kmer_sizes", (5, 6))),
+                max_homopolymer_motif=GEN_CONFIG.get("max_homopolymer_motif", 5),
+                reject_high_motif_repeat=GEN_CONFIG.get("reject_high_motif_repeat", True),
+                motif_prefix_len=GEN_CONFIG.get("motif_prefix_len", 8),
             )
 
+            max_decode_sim = GEN_CONFIG.get("max_latent_sim_for_decode", 0.0)
             strict_candidates = [
-                c for c in candidates if c['latent_similarity'] <= max_latent_similarity
+                c for c in candidates
+                if c['latent_similarity'] <= max_latent_similarity
+                and c.get('latent_sim', c.get('sequence_sim', 1.0)) <= max_decode_sim
             ]
-            output_candidates = strict_candidates[:n_keep]
+            output_candidates = select_diverse_output_candidates(
+                strict_candidates,
+                n_keep=n_keep,
+                max_same_prefix=GEN_CONFIG.get("max_same_prefix", 2),
+                prefix_len=GEN_CONFIG.get("motif_prefix_len", 8),
+            )
             used_relaxed = False
             if not output_candidates and GEN_CONFIG.get("allow_relaxed_fallback", False):
                 used_relaxed = True
-                output_candidates = candidates[:n_keep]
+                output_candidates = select_diverse_output_candidates(
+                    candidates,
+                    n_keep=n_keep,
+                    max_same_prefix=GEN_CONFIG.get("max_same_prefix", 2),
+                    prefix_len=GEN_CONFIG.get("motif_prefix_len", 8),
+                )
 
             f.write(
                 f"\n  n_latent_points={GEN_CONFIG['n_latent_points']}, "
@@ -672,12 +752,17 @@ if __name__ == '__main__':
                     f"  latent_similarity: min={min(sims):.4f}, "
                     f"mean={np.mean(sims):.4f}, max={max(sims):.4f}\n"
                 )
-                if any("sequence_sim" in c for c in candidates):
-                    seq_sims = [c["sequence_sim"] for c in candidates if "sequence_sim" in c]
+                if any("latent_sim" in c or "sequence_sim" in c for c in candidates):
+                    seq_sims = [
+                        c.get("latent_sim", c.get("sequence_sim"))
+                        for c in candidates
+                        if "latent_sim" in c or "sequence_sim" in c
+                    ]
                     f.write(
-                        f"  sequence_sim: min={min(seq_sims):.4f}, "
+                        f"  latent_sim(decoded): min={min(seq_sims):.4f}, "
                         f"mean={np.mean(seq_sims):.4f}, max={max(seq_sims):.4f}, "
-                        f"pass_vs_positive_mean={sum(1 for s in seq_sims if s < target.get('positive_mean', 1.0))}/{len(seq_sims)}\n"
+                        f"pass_vs_positive_mean={sum(1 for s in seq_sims if s < target.get('positive_mean', 1.0))}/{len(seq_sims)}, "
+                        f"pass_latent_sim_filter={sum(1 for s in seq_sims if s <= max_decode_sim)}/{len(seq_sims)}\n"
                     )
                     generation_stats.append({
                         "molecule_index": mol_counter,
@@ -695,42 +780,129 @@ if __name__ == '__main__':
                 print("  Нет кандидатов после GRU-генерации")
                 continue
 
+            tool_candidates = select_top_candidates_for_tools(
+                strict_candidates if strict_candidates else candidates,
+                top_k=top_k_tools,
+                max_motif_penalty=GEN_CONFIG.get("max_motif_penalty_for_tools", 0.05),
+            )
+            f.write(f"\n  TOP {top_k_tools} FOR TOOLS (RSAPred/Boltz):\n")
+            for tool_rank, tool_cand in enumerate(tool_candidates, start=1):
+                tool_decoded = tool_cand.get("latent_sim", tool_cand.get("sequence_sim"))
+                decoded_val = float(tool_decoded) if tool_decoded is not None else float("nan")
+                f.write(
+                    f"    #{tool_rank} DNA={tool_cand['sequence']} | "
+                    f"RNA={tool_cand['sequence'].replace('T', 'U')} | "
+                    f"decoded_sim={decoded_val:.4f} | "
+                    f"motif_penalty={tool_cand.get('motif_penalty', 0.0):.3f}\n"
+                )
+                top_tool_rows.append({
+                    "molecule_index": mol_counter,
+                    "tool_rank": tool_rank,
+                    "canonical_smiles": mol_smiles,
+                    "contrastive_separation": target.get("contrastive_separation"),
+                    "dna_sequence": tool_cand["sequence"],
+                    "rna_sequence": tool_cand["sequence"].replace("T", "U"),
+                    "decoded_sim": decoded_val,
+                    "motif_penalty": tool_cand.get("motif_penalty", 0.0),
+                    "composite_score": tool_cand.get("composite_score"),
+                    "seed_sim": tool_cand.get("latent_similarity"),
+                })
+
             for i, candidate in enumerate(output_candidates):
                 new_aptamer = candidate['sequence']
                 relaxed = used_relaxed or candidate['latent_similarity'] > max_latent_similarity
+                seed_sim = candidate['latent_similarity']
+                decoded_sim = candidate.get(
+                    'latent_sim',
+                    candidate.get('sequence_sim'),
+                )
                 f.write(f"\n  Aptamer #{i + 1}:\n")
                 f.write(f"  {new_aptamer}\n")
-                seq_sim_text = ""
-                if "sequence_sim" in candidate:
-                    seq_sim_text = f", sequence_sim={candidate['sequence_sim']:.4f}"
+                decoded_text = (
+                    f", decoded_sim={decoded_sim:.4f}"
+                    if decoded_sim is not None
+                    else ""
+                )
                 f.write(
-                    f"  latent_similarity={candidate['latent_similarity']:.4f}, "
+                    f"  seed_sim={seed_sim:.4f}{decoded_text}, "
                     f"length={candidate['length']}, GC={candidate['gc']:.2f}, "
-                    f"relaxed={relaxed}{seq_sim_text}\n"
+                    f"motif_penalty={candidate.get('motif_penalty', 0.0):.3f}, "
+                    f"relaxed={relaxed}\n"
                 )
 
+                decoded_display = f"{decoded_sim:.4f}" if decoded_sim is not None else "n/a"
+                motif_pen = candidate.get("motif_penalty")
+                motif_text = f", motif_pen={motif_pen:.3f}" if motif_pen is not None else ""
                 print(
                     f"  Aptamer {i + 1}: {new_aptamer[:60]}... "
-                    f"(latent_sim={candidate['latent_similarity']:.4f}, "
-                    f"relaxed={relaxed}{seq_sim_text})"
+                    f"(seed_sim={seed_sim:.4f}, decoded_sim={decoded_display}{motif_text}, "
+                    f"relaxed={relaxed})"
                 )
+                pair_rows.append({
+                    "molecule_index": mol_counter,
+                    "canonical_smiles": mol_smiles,
+                    "contrastive_separation": target.get("contrastive_separation"),
+                    "positive_mean": target.get("positive_mean"),
+                    "negative_mean": target.get("negative_mean"),
+                    "aptamer_rank": i + 1,
+                    "dna_sequence": new_aptamer,
+                    "rna_sequence": new_aptamer.replace("T", "U"),
+                    "seed_sim": seed_sim,
+                    "decoded_sim": decoded_sim,
+                    "motif_penalty": candidate.get("motif_penalty", 0.0),
+                    "length": candidate["length"],
+                    "gc_content": candidate["gc"],
+                    "relaxed": relaxed,
+                })
                 generated_count += 1
 
     print(f"\n" + "=" * 70)
     print(f"Сгенерировано {generated_count} аптамеров для {len(generation_targets)} молекул")
     print(f"Результаты сохранены в 'generated_pairs_molecule_aptamer.txt'")
+    if pair_rows:
+        pairs_df = pd.DataFrame(pair_rows)
+        summary_path = "generation_summary.csv"
+        if resume_from > 0 and os.path.exists(summary_path):
+            old_df = pd.read_csv(summary_path)
+            pairs_df = pd.concat([old_df, pairs_df], ignore_index=True)
+        pairs_df.to_csv(summary_path, index=False)
+        print(f"Таблица пар сохранена в '{summary_path}' ({len(pairs_df)} строк)")
     if generation_stats:
-        print("\nGeneration sequence_sim summary by molecule:")
+        print("\nGeneration decoded_sim summary by molecule:")
         for row in generation_stats:
             print(
                 f"  #{row['molecule_index']} sep={row['contrastive_separation']:.4f} "
-                f"seq_sim min/mean/max="
+                f"decoded_sim min/mean/max="
                 f"{row['sequence_sim_min']:.4f}/"
                 f"{row['sequence_sim_mean']:.4f}/"
                 f"{row['sequence_sim_max']:.4f} "
                 f"saved={row['n_saved']}/{row['n_candidates']}"
             )
         print(
-            f"  Overall mean sequence_sim: "
+            f"  Overall mean decoded_sim: "
             f"{np.mean([r['sequence_sim_mean'] for r in generation_stats]):.4f}"
         )
+
+    if top_tool_rows:
+        tools_df = pd.DataFrame(top_tool_rows)
+        tools_path = "top_candidates_for_tools.csv"
+        tools_df.to_csv(tools_path, index=False, encoding="utf-8-sig")
+        print(f"\nТоп-{top_k_tools} для тулов сохранён в '{tools_path}' ({len(tools_df)} строк)")
+
+        print("\n" + "=" * 70)
+        print(f"TOP {top_k_tools} CANDIDATES PER MOLECULE (RSAPred / Boltz)")
+        print("=" * 70)
+        for mol_idx in sorted(tools_df["molecule_index"].unique()):
+            mol_block = tools_df[tools_df["molecule_index"] == mol_idx]
+            smiles = str(mol_block.iloc[0]["canonical_smiles"])
+            sep = mol_block.iloc[0].get("contrastive_separation")
+            sep_text = f"{float(sep):.4f}" if pd.notna(sep) else "n/a"
+            print(f"\nMOLECULE #{int(mol_idx)} | sep={sep_text}")
+            print(f"  SMILES: {smiles[:100]}{'...' if len(smiles) > 100 else ''}")
+            for _, row in mol_block.sort_values("tool_rank").iterrows():
+                print(
+                    f"  #{int(row['tool_rank'])} decoded={row['decoded_sim']:.4f} "
+                    f"motif={row['motif_penalty']:.3f}"
+                )
+                print(f"      DNA: {row['dna_sequence']}")
+                print(f"      RNA: {row['rna_sequence']}")
