@@ -10,6 +10,8 @@ from tqdm import tqdm
 import Levenshtein
 from sklearn.model_selection import train_test_split
 
+from aptamer_structure import DEFAULT_STRUCTURE_FILTER, evaluate_secondary_structure
+
 # Словарь: нуклеотиды + служебные токены
 CHAR_TO_IDX = {'A': 0, 'C': 1, 'G': 2, 'T': 3}
 IDX_TO_CHAR = {0: 'A', 1: 'C', 2: 'G', 3: 'T'}
@@ -246,7 +248,8 @@ def build_aligned_training_pairs(df, model, device, negative_only=True):
 
 def train_conditional_decoder(decoder, mol_embeddings, apt_embeddings, sequences,
                               epochs=100, batch_size=32, lr=1e-3, device='cpu',
-                              scheduled_sampling_max=0.4):
+                              scheduled_sampling_max=0.4, tracker=None,
+                              save_path='best_conditional_decoder.pth'):
     """
     Обучает условный декодер: молекула + латентная точка → аптамер.
     sequences должны быть выровнены с mol_embeddings и apt_embeddings (одинаковая длина).
@@ -279,14 +282,37 @@ def train_conditional_decoder(decoder, mol_embeddings, apt_embeddings, sequences
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=5)
     criterion = nn.CrossEntropyLoss(ignore_index=PAD_IDX)
 
+    if tracker is not None:
+        tracker.log_params(
+            {
+                'epochs': epochs,
+                'batch_size': batch_size,
+                'learning_rate': lr,
+                'weight_decay': 1e-5,
+                'scheduled_sampling_max': scheduled_sampling_max,
+                'train_samples': len(train_mol),
+                'val_samples': len(val_mol),
+                'split_seed': 42,
+                'mol_dim': decoder.mol_dim,
+                'latent_dim': decoder.latent_dim,
+                'hidden_dim': decoder.hidden_dim,
+                'num_layers': decoder.num_layers,
+                'dropout': decoder.gru.dropout,
+                'min_len': decoder.min_len,
+                'max_len': decoder.max_len,
+                'vocab_size': decoder.vocab_size,
+            },
+            prefix='gru',
+        )
+
     print(f"\nTraining CONDITIONAL decoder on {len(train_mol)} samples...")
     print(f"  Input: molecule ({decoder.mol_dim}) + latent ({decoder.latent_dim})")
     print(f"  Seq length: {decoder.min_len}–{decoder.max_len}, vocab={decoder.vocab_size}")
     print(f"  Device: {device}")
 
     best_val_loss = float('inf')
+    best_epoch = 0
     patience_counter = 0
-    save_path = 'best_conditional_decoder.pth'
 
     for epoch in range(epochs):
         decoder.train()
@@ -334,11 +360,24 @@ def train_conditional_decoder(decoder, mol_embeddings, apt_embeddings, sequences
         val_loss /= len(val_loader)
         scheduler.step(val_loss)
 
+        if tracker is not None:
+            tracker.log_metrics(
+                {
+                    'train_loss': train_loss,
+                    'val_loss': val_loss,
+                    'teacher_forcing_ratio': tf_ratio,
+                    'learning_rate': optimizer.param_groups[0]['lr'],
+                },
+                step=epoch + 1,
+                prefix='gru',
+            )
+
         if (epoch + 1) % 10 == 0:
             print(f"  Epoch {epoch + 1}: train={train_loss:.4f}, val={val_loss:.4f}, tf={tf_ratio:.2f}")
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
+            best_epoch = epoch + 1
             patience_counter = 0
             torch.save(decoder.state_dict(), save_path)
         else:
@@ -350,6 +389,12 @@ def train_conditional_decoder(decoder, mol_embeddings, apt_embeddings, sequences
     if os.path.exists(save_path):
         decoder.load_state_dict(torch.load(save_path, map_location=device))
     print(f"\nBest model loaded, val loss: {best_val_loss:.4f}")
+    if tracker is not None:
+        tracker.log_metrics(
+            {'best_val_loss': best_val_loss, 'best_epoch': best_epoch},
+            prefix='gru',
+        )
+        tracker.log_artifact(save_path, artifact_path='models/gru')
     return decoder
 
 
@@ -502,6 +547,39 @@ def select_negative_latent_points(mol_embedding, local_negative_points=None, glo
 
 
 DEFAULT_OVERUSED_PREFIXES = ("CTTACGAC", "GGGACGAC", "TTCAAATCT")
+DEFAULT_OVERUSED_SUFFIXES = ("TGTCCC", "GTCGTCCC", "GTCGTAAG")
+
+
+def normalized_edit_distance(a: str, b: str) -> float:
+    return Levenshtein.distance(str(a), str(b)) / max(len(a), len(b), 1)
+
+
+def is_sequence_diverse_enough(seq, kept_sequences, min_normalized_distance=0.25):
+    for kept in kept_sequences:
+        if normalized_edit_distance(seq, kept) < min_normalized_distance:
+            return False
+    return True
+
+
+def has_overused_motif(
+    seq,
+    overused_prefixes=DEFAULT_OVERUSED_PREFIXES,
+    overused_suffixes=DEFAULT_OVERUSED_SUFFIXES,
+    prefix_len=8,
+):
+    seq = str(seq).upper()
+    seq_prefix = seq[:prefix_len]
+    for known in overused_prefixes:
+        if seq.startswith(known):
+            return True, "overused_prefix", known
+        known_prefix = known[:prefix_len]
+        if len(seq_prefix) >= 6 and seq_prefix == known_prefix:
+            return True, "overused_prefix_partial", known_prefix
+
+    for known in overused_suffixes:
+        if seq.endswith(known):
+            return True, "overused_suffix", known
+    return False, None, None
 
 
 def _max_kmer_repeat(seq, k=5):
@@ -532,7 +610,9 @@ def compute_motif_penalty(
     max_kmer_repeat=2,
     max_homopolymer=5,
     overused_prefixes=DEFAULT_OVERUSED_PREFIXES,
+    overused_suffixes=DEFAULT_OVERUSED_SUFFIXES,
     prefix_len=8,
+    reject_overused_prefixes=False,
 ):
     """
     Штраф за повторяющиеся мотивы. Чем выше penalty, тем хуже кандидат.
@@ -557,17 +637,22 @@ def compute_motif_penalty(
         if hp > max_homopolymer + 2:
             return penalty, True, details
 
-    seq_prefix = seq[:prefix_len]
-    for known in overused_prefixes:
-        if seq.startswith(known):
+    overused, motif_kind, motif_value = has_overused_motif(
+        seq,
+        overused_prefixes=overused_prefixes,
+        overused_suffixes=overused_suffixes,
+        prefix_len=prefix_len,
+    )
+    if overused:
+        details[motif_kind] = motif_value
+        if motif_kind == "overused_prefix":
             penalty += 0.12
-            details["overused_prefix"] = known
-            break
-        known_prefix = known[:prefix_len]
-        if len(seq_prefix) >= 6 and seq_prefix == known_prefix:
+        elif motif_kind == "overused_prefix_partial":
             penalty += 0.08
-            details["overused_prefix_partial"] = known_prefix
-            break
+        else:
+            penalty += 0.10
+        if reject_overused_prefixes:
+            return penalty, True, details
 
     return penalty, False, details
 
@@ -578,9 +663,11 @@ def annotate_candidates_with_motif_penalty(
     max_kmer_repeat=2,
     max_homopolymer=5,
     overused_prefixes=DEFAULT_OVERUSED_PREFIXES,
+    overused_suffixes=DEFAULT_OVERUSED_SUFFIXES,
     prefix_len=8,
     motif_penalty_weight=0.15,
     reject_high_motif_repeat=True,
+    reject_overused_prefixes=False,
 ):
     """Добавляет motif_penalty и composite_score к каждому кандидату."""
     annotated = []
@@ -592,7 +679,9 @@ def annotate_candidates_with_motif_penalty(
             max_kmer_repeat=max_kmer_repeat,
             max_homopolymer=max_homopolymer,
             overused_prefixes=overused_prefixes,
+            overused_suffixes=overused_suffixes,
             prefix_len=prefix_len,
+            reject_overused_prefixes=reject_overused_prefixes,
         )
         item["motif_penalty"] = float(penalty)
         item["motif_details"] = details
@@ -611,10 +700,12 @@ def rank_candidates_with_motif_penalty(
     candidates,
     motif_penalty_weight=0.15,
     reject_high_motif_repeat=True,
+    reject_overused_prefixes=False,
     kmer_sizes=(5, 6),
     max_kmer_repeat=2,
     max_homopolymer=5,
     overused_prefixes=DEFAULT_OVERUSED_PREFIXES,
+    overused_suffixes=DEFAULT_OVERUSED_SUFFIXES,
     prefix_len=8,
 ):
     """Фильтрует по мотивам и сортирует: меньший composite_score = лучше."""
@@ -624,9 +715,11 @@ def rank_candidates_with_motif_penalty(
         max_kmer_repeat=max_kmer_repeat,
         max_homopolymer=max_homopolymer,
         overused_prefixes=overused_prefixes,
+        overused_suffixes=overused_suffixes,
         prefix_len=prefix_len,
         motif_penalty_weight=motif_penalty_weight,
         reject_high_motif_repeat=reject_high_motif_repeat,
+        reject_overused_prefixes=reject_overused_prefixes,
     )
     kept = [c for c in annotated if not c.get("motif_reject", False)]
     kept.sort(key=lambda item: item.get("composite_score", item.get("latent_sim", 0.0)))
@@ -638,17 +731,34 @@ def select_diverse_output_candidates(
     n_keep,
     max_same_prefix=2,
     prefix_len=8,
+    min_sequence_distance=0.0,
+    max_motif_penalty=None,
     backfill_to_n_keep=True,
 ):
-    """Ограничивает число последовательностей с одинаковым префиксом."""
+    """Ограничивает число последовательностей с одинаковым префиксом и edit-distance."""
     selected = []
     prefix_counts = {}
-    for candidate in candidates:
-        prefix = candidate["sequence"][:prefix_len]
+    kept_sequences = []
+
+    def _accept(candidate):
+        seq = candidate["sequence"]
+        if max_motif_penalty is not None and candidate.get("motif_penalty", 0.0) > max_motif_penalty:
+            return False
+        prefix = seq[:prefix_len]
         if prefix_counts.get(prefix, 0) >= max_same_prefix:
+            return False
+        if min_sequence_distance > 0 and not is_sequence_diverse_enough(
+            seq, kept_sequences, min_normalized_distance=min_sequence_distance
+        ):
+            return False
+        return True
+
+    for candidate in candidates:
+        if not _accept(candidate):
             continue
         selected.append(candidate)
-        prefix_counts[prefix] = prefix_counts.get(prefix, 0) + 1
+        kept_sequences.append(candidate["sequence"])
+        prefix_counts[candidate["sequence"][:prefix_len]] = prefix_counts.get(candidate["sequence"][:prefix_len], 0) + 1
         if len(selected) >= n_keep:
             break
 
@@ -656,6 +766,8 @@ def select_diverse_output_candidates(
         seen = {c["sequence"] for c in selected}
         for candidate in candidates:
             if candidate["sequence"] in seen:
+                continue
+            if max_motif_penalty is not None and candidate.get("motif_penalty", 0.0) > max_motif_penalty:
                 continue
             selected.append(candidate)
             seen.add(candidate["sequence"])
@@ -669,10 +781,14 @@ def select_top_candidates_for_tools(
     candidates,
     top_k=3,
     max_motif_penalty=0.05,
+    min_sequence_distance=0.0,
+    max_same_prefix=1,
+    prefix_len=8,
+    allow_motif_fallback=True,
 ):
     """
     Top-K кандидатов для внешней валидации (RSAPred / Boltz).
-    Сначала diverse (motif_penalty <= max), иначе backfill из полного ранжированного пула.
+    Сначала diverse (motif_penalty <= max), иначе optional backfill из полного пула.
     """
     if not candidates:
         return []
@@ -685,8 +801,42 @@ def select_top_candidates_for_tools(
         ),
     )
     diverse = [c for c in ranked if c.get("motif_penalty", 0.0) <= max_motif_penalty]
-    pool = diverse if len(diverse) >= top_k else ranked
-    return pool[:top_k]
+    if len(diverse) >= top_k or not allow_motif_fallback:
+        pool = diverse
+    else:
+        pool = ranked
+
+    return select_diverse_output_candidates(
+        pool,
+        n_keep=top_k,
+        max_same_prefix=max_same_prefix,
+        prefix_len=prefix_len,
+        min_sequence_distance=min_sequence_distance,
+        max_motif_penalty=max_motif_penalty if not allow_motif_fallback else None,
+        backfill_to_n_keep=allow_motif_fallback,
+    )
+
+
+def passes_structure_aptamer_filters(
+    seq,
+    *,
+    use_structure_filter=False,
+    structure_filter_kwargs=None,
+):
+    """Фильтр по вторичной структуре (ViennaRNA MFE / fallback)."""
+    if not use_structure_filter:
+        return True, {}
+    kwargs = dict(DEFAULT_STRUCTURE_FILTER)
+    if structure_filter_kwargs:
+        kwargs.update(structure_filter_kwargs)
+    passes, penalty, reject, details = evaluate_secondary_structure(
+        seq,
+        molecule_type="dna",
+        **kwargs,
+    )
+    details["structure_penalty"] = float(penalty)
+    details["structure_reject"] = bool(reject)
+    return passes, details
 
 
 def passes_basic_aptamer_filters(seq, min_len=20, max_len=50, max_homopolymer=6, gc_range=(0.2, 0.8)):
@@ -1191,8 +1341,13 @@ def generate_ranked_aptamers_for_molecule(decoder, mol_embedding, local_negative
                                           motif_kmer_sizes=(5, 6),
                                           max_homopolymer_motif=5,
                                           reject_high_motif_repeat=True,
+                                          reject_overused_prefixes=False,
                                           overused_prefixes=DEFAULT_OVERUSED_PREFIXES,
-                                          motif_prefix_len=8):
+                                          overused_suffixes=DEFAULT_OVERUSED_SUFFIXES,
+                                          motif_prefix_len=8,
+                                          latent_jitter_seed=42,
+                                          use_structure_filter=False,
+                                          structure_filter_kwargs=None):
     """
     Генерирует кандидаты для целевой молекулы и возвращает их, отсортированными от
     наиболее вероятно не взаимодействующих к менее надёжным по latent cosine score.
@@ -1211,6 +1366,7 @@ def generate_ranked_aptamers_for_molecule(decoder, mol_embedding, local_negative
         latent_scores,
         jitter_copies=latent_jitter_copies,
         jitter_std=latent_jitter_std,
+        seed=latent_jitter_seed,
     )
 
     min_len = decoder.min_len if min_seq_len is None else min_seq_len
@@ -1243,12 +1399,26 @@ def generate_ranked_aptamers_for_molecule(decoder, mol_embedding, local_negative
             seen.add(seq)
             if not passes_basic_aptamer_filters(seq, min_len, max_len):
                 continue
-            candidates.append({
+            passes_structure, structure_details = passes_structure_aptamer_filters(
+                seq,
+                use_structure_filter=use_structure_filter,
+                structure_filter_kwargs=structure_filter_kwargs,
+            )
+            if not passes_structure:
+                continue
+            candidate = {
                 'sequence': seq,
                 'latent_similarity': point_score,
                 'length': len(seq),
                 'gc': float((seq.count('G') + seq.count('C')) / max(len(seq), 1)),
-            })
+            }
+            if structure_details:
+                candidate['structure_details'] = structure_details
+                candidate['structure_penalty'] = float(structure_details.get('structure_penalty', 0.0))
+                candidate['mfe_per_nt'] = float(structure_details.get('mfe_per_nt', 0.0))
+                candidate['paired_frac'] = float(structure_details.get('paired_frac', 0.0))
+                candidate['unpaired_frac'] = float(structure_details.get('unpaired_frac', 0.0))
+            candidates.append(candidate)
 
     if (
         contrastive_model is not None
@@ -1269,10 +1439,12 @@ def generate_ranked_aptamers_for_molecule(decoder, mol_embedding, local_negative
             candidates,
             motif_penalty_weight=motif_penalty_weight,
             reject_high_motif_repeat=reject_high_motif_repeat,
+            reject_overused_prefixes=reject_overused_prefixes,
             kmer_sizes=motif_kmer_sizes,
             max_kmer_repeat=max_kmer_repeat,
             max_homopolymer=max_homopolymer_motif,
             overused_prefixes=overused_prefixes,
+            overused_suffixes=overused_suffixes,
             prefix_len=motif_prefix_len,
         )
     else:
@@ -1281,10 +1453,12 @@ def generate_ranked_aptamers_for_molecule(decoder, mol_embedding, local_negative
             candidates,
             motif_penalty_weight=motif_penalty_weight,
             reject_high_motif_repeat=reject_high_motif_repeat,
+            reject_overused_prefixes=reject_overused_prefixes,
             kmer_sizes=motif_kmer_sizes,
             max_kmer_repeat=max_kmer_repeat,
             max_homopolymer=max_homopolymer_motif,
             overused_prefixes=overused_prefixes,
+            overused_suffixes=overused_suffixes,
             prefix_len=motif_prefix_len,
         )
 
