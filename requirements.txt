@@ -30,10 +30,14 @@ python-Levenshtein>=0.21
 # --- Wasserstein analysis ---
 POT>=0.9
 
+# --- Учёт экспериментов (опционально; MLFLOW_ENABLED=0 отключает) ---
+mlflow
+
 # --- Optional (boltz_script.py plots) ---
 # matplotlib уже выше
 
-# --- NOT included (install separately) ---
+# --- Aptamer structure filtering (generation) ---
+ViennaRNA>=2.6
 # boltz              # Boltz-2 CLI, separate environment
 # vina py3Dmol       # docking, Google Colab only
 # openbabel          # docking prep
