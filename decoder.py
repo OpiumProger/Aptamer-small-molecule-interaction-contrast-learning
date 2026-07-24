@@ -83,18 +83,50 @@ def full_pipeline(model, test_loader, device, n_clusters=5):
     return cluster_labels, embeddings_768d, types
 
 
-def get_negative_cluster_embeddings(embeddings, cluster_labels, types):
-    """Возвращает эмбеддинги из кластера с максимальным числом negative точек."""
+def get_negative_cluster_embeddings(
+    embeddings,
+    cluster_labels,
+    types,
+    pos_penalty=1.0,
+    min_negatives=1,
+):
+    """
+    Выбирает кластер с max(n_neg - pos_penalty * n_pos) и возвращает
+    только точки с label=negative из этого кластера.
+    """
     n_clusters = len(np.unique(cluster_labels))
     best_cluster = None
-    best_neg_count = 0
+    best_score = float('-inf')
+    cluster_stats = []
 
     for i in range(n_clusters):
         mask = cluster_labels == i
-        n_neg = (types[mask] == 'negative').sum()
-        if n_neg > best_neg_count:
-            best_neg_count = n_neg
+        n_pos = int((types[mask] == 'positive').sum())
+        n_neg = int((types[mask] == 'negative').sum())
+        score = n_neg - pos_penalty * n_pos
+        cluster_stats.append((i, n_pos, n_neg, score))
+        if n_neg >= min_negatives and score > best_score:
+            best_score = score
             best_cluster = i
 
-    mask = cluster_labels == best_cluster
-    return embeddings[mask], best_cluster, best_neg_count
+    if best_cluster is None:
+        neg_mask = types == 'negative'
+        return embeddings[neg_mask], -1, int(neg_mask.sum())
+
+    print("\nNegative cluster selection:")
+    for cluster_id, n_pos, n_neg, score in cluster_stats:
+        marker = " <-- selected" if cluster_id == best_cluster else ""
+        print(
+            f"  Cluster {cluster_id}: pos={n_pos}, neg={n_neg}, "
+            f"score={score:.1f}{marker}"
+        )
+
+    cluster_mask = cluster_labels == best_cluster
+    neg_mask = cluster_mask & (types == 'negative')
+    n_neg_selected = int(neg_mask.sum())
+    print(
+        f"  Using cluster {best_cluster}: {n_neg_selected} negative embeddings "
+        f"(excluded {(cluster_mask & (types == 'positive')).sum()} positives)"
+    )
+
+    return embeddings[neg_mask], best_cluster, n_neg_selected
