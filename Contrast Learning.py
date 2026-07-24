@@ -12,13 +12,18 @@ from FinalTrainer import FinalTrainer
 from DataPrepare import FinalContrastiveDataset, molecule_disjoint_split, DEFAULT_NEGATIVE_RATIO
 from Model import MicroContrastiveModel
 from load_data_and_visual_data import load_data, analyze_results, visualize_embeddings_correct, visualize_embeddings_2d_simple
+from mlflow_tracking import create_pipeline_tracker
 
 DATA_FILE = "aptabench_with_embeddings_v2.csv"
 MODEL_CHECKPOINT = "final_micro_model.pth"
 USE_PRETRAINED = False  # False = заново обучить contrastive + GRU; True = загрузить готовые веса
 
 
-def main(train_contrastive: bool = True, model_checkpoint: str = MODEL_CHECKPOINT):
+def main(
+    train_contrastive: bool = True,
+    model_checkpoint: str = MODEL_CHECKPOINT,
+    tracker=None,
+):
     print("=" * 70)
     print("CONTRASTIVE LEARNING WITH VISUALIZATION")
     print("=" * 70)
@@ -41,6 +46,17 @@ def main(train_contrastive: bool = True, model_checkpoint: str = MODEL_CHECKPOIN
         train_neg_idx, val_neg_idx, test_neg_idx,
         split_stats,
     ) = molecule_disjoint_split(df, seed=42)
+
+    if tracker is not None:
+        tracker.log_params(
+            {
+                'file': data_file,
+                'split_seed': 42,
+                'negative_ratio': DEFAULT_NEGATIVE_RATIO,
+                **split_stats,
+            },
+            prefix='data',
+        )
 
     n_pos = len(smi_pos)
     n_neg = len(smi_neg)
@@ -128,6 +144,19 @@ def main(train_contrastive: bool = True, model_checkpoint: str = MODEL_CHECKPOIN
         latent_dim=768,
         projection_dim=768
     )
+    if tracker is not None:
+        tracker.log_params(
+            {
+                'class': type(model).__name__,
+                'input_dim_apt': 768,
+                'input_dim_mol': 768,
+                'latent_dim': 768,
+                'projection_dim': 768,
+                'batch_size': 32,
+                'max_epochs': 30,
+            },
+            prefix='contrastive.model',
+        )
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"\n Device: {device}")
@@ -136,7 +165,8 @@ def main(train_contrastive: bool = True, model_checkpoint: str = MODEL_CHECKPOIN
         model=model,
         train_loader=train_loader,
         val_loader=val_loader,
-        device=device
+        device=device,
+        tracker=tracker,
     )
 
     history = {}
@@ -144,10 +174,22 @@ def main(train_contrastive: bool = True, model_checkpoint: str = MODEL_CHECKPOIN
         print(f"\nLoading pretrained contrastive model from '{model_checkpoint}' (skip training)")
         checkpoint = torch.load(model_checkpoint, map_location=device)
         model.load_state_dict(checkpoint['model_state_dict'])
+        if tracker is not None:
+            tracker.set_tags({'contrastive_mode': 'pretrained'})
+            tracker.log_artifact(
+                model_checkpoint, artifact_path='models/contrastive'
+            )
     else:
+        if tracker is not None:
+            tracker.set_tags({'contrastive_mode': 'train'})
         print("\n Starting contrastive training...")
         history = trainer.train(n_epochs=30, save_path=model_checkpoint)
         plot_final_results(history)
+        if tracker is not None:
+            tracker.log_artifact(
+                'final_training_results.png',
+                artifact_path='plots/contrastive',
+            )
         try:
             checkpoint = torch.load(model_checkpoint, map_location=device)
             model.load_state_dict(checkpoint['model_state_dict'])
@@ -167,9 +209,31 @@ def main(train_contrastive: bool = True, model_checkpoint: str = MODEL_CHECKPOIN
     print(f"    ROC-AUC (pair-level mean): {test_results['pair_roc_auc']:.3f}")
     print(f"    Positive mean similarity: {test_results['pos_mean']:.3f}")
     print(f"    Negative mean similarity: {test_results['neg_mean']:.3f}")
+    if tracker is not None:
+        tracker.log_metrics(
+            {
+                key: test_results.get(key)
+                for key in (
+                    'accuracy',
+                    'separation',
+                    'overlap_pct',
+                    'roc_auc',
+                    'pr_auc',
+                    'pair_roc_auc',
+                    'pos_mean',
+                    'neg_mean',
+                )
+            },
+            prefix='contrastive.test',
+        )
 
     if history:
         plot_similarity_distributions(test_results)
+        if tracker is not None:
+            tracker.log_artifact(
+                'final_similarity_distributions.png',
+                artifact_path='plots/contrastive',
+            )
 
     visualize_embeddings_correct(
         model=model,
@@ -177,6 +241,11 @@ def main(train_contrastive: bool = True, model_checkpoint: str = MODEL_CHECKPOIN
         device=device,
         save_path='embedding_visualization_correct.png'
     )
+    if tracker is not None:
+        tracker.log_artifact(
+            'embedding_visualization_correct.png',
+            artifact_path='plots/contrastive',
+        )
 
     from wasserstein_utils import analyze_model_with_loader
 
@@ -368,10 +437,38 @@ if __name__ == '__main__':
     from decoder import full_pipeline, get_negative_cluster_embeddings
 
     use_pretrained = USE_PRETRAINED
-    model, history, test_results, test_loader, device = main(
-        train_contrastive=not use_pretrained,
-        model_checkpoint=MODEL_CHECKPOINT,
+    tracker = create_pipeline_tracker(
+        run_name='aptamer-pipeline-pretrained' if use_pretrained else 'aptamer-pipeline-train',
+        tags={
+            'pipeline': 'contrastive-gru-generation',
+            'mode': 'pretrained' if use_pretrained else 'train',
+        },
     )
+    if not tracker.active:
+        print(
+            "WARNING: MLflow run is NOT active — metrics will not be saved. "
+            f"Reason: {tracker.disabled_reason or 'unknown'}"
+        )
+    tracker.log_params(
+        {
+            'use_pretrained': use_pretrained,
+            'model_checkpoint': MODEL_CHECKPOINT,
+        },
+        prefix='pipeline',
+    )
+    pipeline_status = "FINISHED"
+    try:
+        model, history, test_results, test_loader, device = main(
+            train_contrastive=not use_pretrained,
+            model_checkpoint=MODEL_CHECKPOINT,
+            tracker=tracker,
+        )
+    except Exception:
+        pipeline_status = "FAILED"
+        if not tracker._closed:
+            tracker.set_tags({'pipeline_status': 'failed'})
+            tracker.close(status="FAILED")
+        raise
 
     # ===== ПРОВЕРКА: ЕСЛИ КЛАСТЕРИЗАЦИЯ УЖЕ ВЫПОЛНЕНА =====
     cluster_files_exist = all([
@@ -540,12 +637,17 @@ if __name__ == '__main__':
             conditional_decoder = conditional_decoder.to(device)
             conditional_decoder.eval()
             print("   GRU decoder загружен успешно!")
+            tracker.set_tags({'gru_mode': 'pretrained'})
+            tracker.log_artifact(
+                conditional_decoder_path, artifact_path='models/gru'
+            )
         except RuntimeError as e:
             print(f"   Старые веса GRU несовместимы: {e}")
             print("   Будет выполнено переобучение GRU")
             use_pretrained = False
 
     if not use_pretrained or not os.path.exists(conditional_decoder_path):
+        tracker.set_tags({'gru_mode': 'train'})
         print("\n" + "=" * 70)
         print("TRAINING GRU DECODER (768d Molecule + 768d Negative Latent → Aptamer)")
         print("=" * 70)
@@ -560,6 +662,8 @@ if __name__ == '__main__':
             lr=1e-3,
             device=device,
             scheduled_sampling_max=0.4,
+            tracker=tracker,
+            save_path=conditional_decoder_path,
         )
 
         torch.save(conditional_decoder.state_dict(), conditional_decoder_path)
@@ -598,6 +702,8 @@ if __name__ == '__main__':
         "motif_prefix_len": 8,
         "resume_from_molecule_index": 0,
     }
+    tracker.log_params(GEN_CONFIG, prefix='generation')
+    tracker.log_dict(GEN_CONFIG, 'config/generation_config.json')
 
     n_targets_before_gate = len(generation_targets)
     generation_targets, skipped_targets = filter_generation_targets_by_separation(
@@ -623,6 +729,14 @@ if __name__ == '__main__':
     print(
         f"\nMolecule gating ({gate_label}): "
         f"kept {len(generation_targets)}/{n_targets_before_gate}"
+    )
+    tracker.log_metrics(
+        {
+            'targets_before_gate': n_targets_before_gate,
+            'targets_after_gate': len(generation_targets),
+            'targets_skipped': len(skipped_targets),
+        },
+        prefix='generation',
     )
     if skipped_targets:
         print(f"  Skipped molecules: {len(skipped_targets)}")
@@ -906,3 +1020,50 @@ if __name__ == '__main__':
                 )
                 print(f"      DNA: {row['dna_sequence']}")
                 print(f"      RNA: {row['rna_sequence']}")
+
+    generation_metrics = {
+        'generated_count': generated_count,
+        'molecules_processed': len(generation_targets),
+        'summary_rows': len(pair_rows),
+        'tool_candidate_rows': len(top_tool_rows),
+    }
+    if generation_stats:
+        generation_metrics.update(
+            {
+                'mean_decoded_similarity': np.mean(
+                    [r['sequence_sim_mean'] for r in generation_stats]
+                ),
+                'total_candidates_screened': sum(
+                    r['n_candidates'] for r in generation_stats
+                ),
+                'total_candidates_saved': sum(
+                    r['n_saved'] for r in generation_stats
+                ),
+            }
+        )
+    if pair_rows:
+        motif_values = [
+            row['motif_penalty']
+            for row in pair_rows
+            if row.get('motif_penalty') is not None
+        ]
+        if motif_values:
+            generation_metrics['mean_motif_penalty'] = np.mean(motif_values)
+
+    tracker.log_metrics(generation_metrics, prefix='generation')
+    tracker.log_artifact(
+        'generated_pairs_molecule_aptamer.txt',
+        artifact_path='generation',
+    )
+    if pair_rows:
+        tracker.log_artifact(
+            'generation_summary.csv',
+            artifact_path='generation',
+        )
+    if top_tool_rows:
+        tracker.log_artifact(
+            'top_candidates_for_tools.csv',
+            artifact_path='generation',
+        )
+    tracker.set_tags({'pipeline_status': 'completed'})
+    tracker.close(status=pipeline_status)
