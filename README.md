@@ -1,114 +1,232 @@
-# Contrast Learning — генерация non-interacting аптамеров
+# Contrast Learning — генерация несвязывающихся аптамеров
 
-Пайплайн для генерации DNA/RNA-последовательностей аптамеров, которые **не должны** связываться с заданной малой молекулой. Основан на contrastive learning, кластеризации negative latent seeds и условном GRU-декодере.
+Пайплайн для генерации ДНК/РНК-последовательностей аптамеров, которые **не должны** связываться с заданной малой молекулой. Основан на контрастивном обучении (768→768), кластеризации негативных латентных точек, условном GRU-декодере и постфильтрации (переранжирование + штраф за мотив).
 
-**Внешняя валидация (июнь 2026):** 19 diverse-пар (rerank, `motif_penalty=0`) проверены в RSAPred — **13/19 (68%)** с pKd < 4.5 (negative-like). Подробности — [раздел RSAPred](#rsapred-валидация).
+**Статус проверки (июнь 2026):** на 19 разнообразных парах (RSAPred, в домене, `motif=0`) — **13/19 (68%)** проходят порог RSAPred (pKd < 4.5). Лучший кандидат **mol7_diverse_1** подтверждён тремя метриками (RSAPred + Boltz + Vina). Сводка: `validation_summary.csv`, `rsapred_validation_results.csv`.
 
-## Схема пайплайна
+## Учёт экспериментов (MLflow)
 
-```text
-AptaBench CSV
-    │
-    ▼
-Embeddings.py ──► aptabench_with_embeddings_v2.csv
-    │               (GENA-LM + ChemBERTa, 768d)
-    ▼
-Contrast Learning.py                    run_rsapred_generation.py
-    │ (test split, крупные молекулы)         │ (RSAPred pKd, малые молекулы ≤40 atoms)
-    ├─ MicroContrastiveModel (768→768)       └─ rsapred_* outputs
-    ├─ decoder.py (KMeans → negative seeds)
-    ├─ GRU.py (mol_emb + negative_latent → DNA)
-    └─ generation_summary.csv
-    │
-    ▼
-rerank_generated_aptamers.py ──► rerank_*.csv / rsapred_rerank_all.csv
-    │   (sequence_sim, motif_penalty, rank_diverse)
-    ▼
-Внешняя валидация
-    ├─ RSAPred (pKd) — основная метрика для малых молекул
-    ├─ boltz_script.py (Boltz-2 affinity)
-    └─ Vina / SimRNA (Colab, см. докинг_fixed.ipynb)
+Основной `Contrast Learning.py` пишет один прогон на полный цикл
+`контрастив → GRU → генерация` в `Contrast Learning/mlflow.db`
+(путь зафиксирован к папке проекта, не зависит от текущей директории).
+
+Если при старте нет строки `MLflow run: ...`, учёт **не включился**
+(обычно пакет `mlflow` не установлен в том же Python, что запускает скрипт).
+
+```bash
+# в том же окружении, где крутится пайплайн:
+pip install mlflow
+python -c "import mlflow; print(mlflow.__version__)"
+
+cd "C:\Users\USER\Contrast Learning"
+python check_mlflow.py
+python "Contrast Learning.py"
+
+# интерфейс — абсолютный путь, пробелы оставлять как есть (НЕ %20):
+mlflow ui --backend-store-uri "sqlite:///C:/Users/USER/Contrast Learning/mlflow.db"
 ```
 
-## Структура проекта
+В логе старта ищите эксперимент `aptamer-nonbinder` (не Default).
+Интерфейс: `http://127.0.0.1:5000`.
 
-| Файл | Назначение |
-|------|------------|
-| `Contrast Learning.py` | Главный скрипт: contrastive → кластеры → GRU → генерация (test split) |
-| `run_rsapred_generation.py` | Отдельный прогон для молекул RSAPred с pKd (малые мишени) |
-| `Embeddings.py` | Построение `seq_emb_*` / `smi_emb_*` из сырых sequence + SMILES |
-| `Model.py` | `MicroContrastiveModel` |
-| `DataPrepare.py` | `FinalContrastiveDataset` (global/hard negatives, molecule split) |
-| `FinalTrainer.py` | Обучение contrastive-модели |
-| `Loss.py` | `TemperatureScaledLoss` |
-| `load_data_and_visual_data.py` | Загрузка CSV, метрики, t-SNE/UMAP/PCA |
-| `wasserstein_utils.py` | Wasserstein-анализ разделения pos/neg |
-| `decoder.py` | Кластеризация 768d embeddings → negative seeds для GRU |
-| `GRU.py` | `ConditionalGRUDecoder`, обучение, генерация, `motif_penalty` |
-| `rerank_generated_aptamers.py` | Пост-фильтрация по `sequence_sim` и diverse rank |
-| `export_rsapred_diverse_pairs.py` | Экспорт diverse-пар для ручной проверки в RSAPred |
-| `boltz_script.py` | Batch-прогон Boltz-2 по парам из AptaBench |
-| `CVAE.py` | Альтернативный декодер (экспериментальный) |
-
-### Данные и артефакты
-
-| Файл | Описание |
-|------|----------|
-| `AptaBench_dataset_v2.csv` | Исходные пары (sequence, SMILES, label, source, pKd) |
-| `aptabench_with_embeddings_v2.csv` | Датасет с эмбеддингами (6413 строк) |
-| `final_micro_model.pth` | Веса contrastive-модели |
-| `best_conditional_decoder.pth` | Веса GRU-декодера |
-| `cluster_embeddings_768d.npy` | 768d эмбеддинги для кластеризации |
-| `cluster_labels_768d.npy` | Метки KMeans |
-| `cluster_types.npy` | positive / negative для каждой точки |
-| `generation_summary.csv` | Сводка генерации (default run) |
-| `rsapred_generation_summary.csv` | Сводка RSAPred-прогона (20 молекул) |
-| `rsapred_rerank_all.csv` | Rerank RSAPred-пар |
-| `rsapred_validation_results.csv` | RSAPred pKd для 19 diverse-пар (ручная проверка) |
-| `rsapred_pairs_to_submit.csv` | Diverse-кандидаты для отправки в RSAPred |
-
-Дополнительная документация: `GRU_ARCHITECTURE_AND_PIPELINE.md`, `PIPELINE_HANDOFF.md`, `VALIDATION_PAIRS_CAFFEINE.md`.
+- `MLFLOW_ENABLED=0` — отключить учёт;
+- `MLFLOW_TRACKING_URI=...` — другое хранилище / удалённый сервер.
 
 ---
 
-## Установка окружения
 
-### Вариант A — Conda (рекомендуется)
+
+## Архитектура пайплайна
+
+```mermaid
+flowchart TB
+  subgraph data [Данные]
+    A["AptaBench_dataset_v2.csv<br/>пары молекула–аптамер + метка + pKd"]
+  end
+
+  subgraph emb [1. Эмбеддинги]
+    E["Embeddings.py"]
+    GENA["GENA-LM → seq_emb 768d"]
+    CHEM["ChemBERTa → smi_emb 768d"]
+    CSV["aptabench_with_embeddings_v2.csv"]
+  end
+
+  subgraph contrastive [2. Контрастивное ядро]
+    DP["DataPrepare.py<br/>разбиение по молекулам + жёсткие отрицательные"]
+    M["Model.py<br/>MicroContrastiveModel 768→768"]
+    T["FinalTrainer.py + Loss.py"]
+    W1["final_micro_model.pth"]
+  end
+
+  subgraph seeds [3. Негативные семена]
+    DEC["decoder.py<br/>KMeans по латентам аптамеров"]
+    NP["пул негативного кластера<br/>cluster_*.npy"]
+  end
+
+  subgraph gen [4. Условная генерация]
+    GRU["GRU.py<br/>ConditionalGRUDecoder"]
+    IN["mol_z + negative_latent_seed"]
+    OUT["ДНК-последовательность A/C/G/T"]
+    W2["best_conditional_decoder.pth"]
+  end
+
+  subgraph entry [Точки входа]
+    CL["Contrast Learning.py<br/>полный пайплайн"]
+    RSA["run_rsapred_generation.py<br/>малые молекулы / RSAPred"]
+    MLF["mlflow_tracking.py<br/>эксперимент aptamer-nonbinder"]
+  end
+
+  subgraph post [5. Пост-обработка]
+    RR["rerank_generated_aptamers.py<br/>sequence_sim + штраф за мотив + разнообразие"]
+    EXP["export_rsapred_diverse_pairs.py<br/>/ export_boltz_pairs.py"]
+  end
+
+  subgraph val [6. Внешняя проверка]
+    R["RSAPred pKd"]
+    B["boltz_script.py"]
+    V["Vina / молекулярная динамика<br/>ноутбуки Colab/Kaggle"]
+  end
+
+  A --> E
+  E --> GENA & CHEM --> CSV
+  CSV --> DP --> M
+  M --> T --> W1
+  W1 --> DEC --> NP
+  W1 --> GRU
+  NP --> IN --> GRU --> OUT
+  GRU --> W2
+
+  CL --> DP & DEC & GRU
+  RSA --> GRU
+  CL & RSA --> MLF
+  OUT --> RR --> EXP --> R & B & V
+```
+
+
+
+**Кратко по слоям**
+
+
+| Слой             | Файлы                                                      | Роль                                                    |
+| ---------------- | ---------------------------------------------------------- | ------------------------------------------------------- |
+| Данные           | `AptaBench_*.csv`                                          | пары SMILES–последовательность, метка, pKd              |
+| Эмбеддинги       | `Embeddings.py`                                            | GENA-LM + ChemBERTa → 768d                              |
+| Контрастив       | `Model.py`, `FinalTrainer.py`, `Loss.py`, `DataPrepare.py` | разделение binder / non-binder в латентном пространстве |
+| Семена           | `decoder.py`                                               | KMeans → негативные латентные точки                     |
+| Генерация        | `GRU.py`                                                   | `mol_z` + негативное семя → ДНК                         |
+| Оркестрация      | `Contrast Learning.py`, `run_rsapred_generation.py`        | полный / RSAPred-прогон                                 |
+| Учёт             | `mlflow_tracking.py`                                       | один прогон на пайплайн                                 |
+| Переранжирование | `rerank_generated_aptamers.py`                             | фильтр + разнообразие                                   |
+| Проверка         | RSAPred, Boltz, Vina / МД                                  | триангуляция сродства                                   |
+
+
+**Главная идея:** контрастивная модель учит, что binder близок к молекуле в 768d, а non-binder — далёк. GRU генерирует последовательности из **негативных** семян, чтобы аптамер был «далёким» от молекулы. Дальше — переранжирование и внешняя проверка (RSAPred / Boltz / Vina).
+
+**Важно:** обычный прогон (`Contrast Learning.py`) даёт крупные аминогликозиды — **вне домена RSAPred**. Для проверки сродства к связыванию используйте `run_rsapred_generation.py`.
+
+---
+
+
+
+## Структура проекта
+
+
+
+### Основные скрипты
+
+
+| Файл                                       | Назначение                                                                    |
+| ------------------------------------------ | ----------------------------------------------------------------------------- |
+| `Contrast Learning.py`                     | Полный пайплайн: контрастив → кластеры → GRU → генерация (тестовое разбиение) |
+| `run_rsapred_generation.py`                | Генерация для малых RSAPred-мишеней с pKd (до 20 молекул)                     |
+| `Embeddings.py`                            | `seq_emb_*` / `smi_emb_*` из последовательности + SMILES                      |
+| `DataPrepare.py`                           | датасет, разбиение по молекулам, жёсткие отрицательные примеры                |
+| `Model.py` / `FinalTrainer.py` / `Loss.py` | контрастивная модель и обучение                                               |
+| `decoder.py`                               | KMeans → семена негативного кластера                                          |
+| `GRU.py`                                   | условный декодер, генерация, штраф за мотив, отбор по разнообразию            |
+| `rerank_generated_aptamers.py`             | постфильтрация: `sequence_sim`, `rank_diverse`                                |
+| `export_rsapred_diverse_pairs.py`          | экспорт разнообразных пар (`motif=0`) для RSAPred                             |
+| `export_boltz_pairs.py`                    | экспорт пар для Boltz из CSV переранжирования                                 |
+| `boltz_script.py`                          | пакетный Boltz-2 (`aptabench` / `--from-selected-pairs`)                      |
+| `diagnose_contrastive_training.py`         | диагностика разделимости после обучения                                       |
+| `preview_rsapred_targets.py`               | просмотр мишеней RSAPred-прогона                                              |
+| `mlflow_tracking.py`                       | учёт экспериментов                                                            |
+| `colab_md_runner.py` / `vina_md_screen.py` | докинг и короткая МД (Colab/Kaggle)                                           |
+
+
+
+
+### Артефакты
+
+
+| Файл                                  | Описание                                    |
+| ------------------------------------- | ------------------------------------------- |
+| `final_micro_model.pth`               | веса контрастивной модели                   |
+| `best_conditional_decoder.pth`        | веса GRU                                    |
+| `cluster_*.npy`                       | кластеры KMeans негативных семян            |
+| `generation_summary.csv`              | обычная генерация                           |
+| `rsapred_generation_summary.csv`      | RSAPred-генерация (20 молекул)              |
+| `rsapred_rerank_all.csv`              | переранжирование RSAPred-пар                |
+| `rsapred_validation_results.csv`      | RSAPred pKd, 19 разнообразных пар           |
+| `rsapred_pairs_to_submit.csv`         | 19 пар для ручной проверки                  |
+| `rsapred_selenium_batch.py`           | пакетная отправка пар в RSAPred             |
+| `requirements-rsapred-automation.txt` | зависимости для `rsapred_selenium_batch.py` |
+| `boltz_rsapred_top10_pairs.csv`       | топ-10 для Boltz                            |
+| `validation_summary.csv`              | RSAPred + Boltz + Vina (сводная)            |
+
+
+Доп. документация: `GRU_ARCHITECTURE_AND_PIPELINE.md`, `PIPELINE_HANDOFF.md`, `VALIDATION_PAIRS_CAFFEINE.md`.
+
+---
+
+
+
+## Установка
+
+
+
+### Conda (генерация + contrastive)
 
 ```bash
-cd "C:\Users\USER\Contrast Learning"
+cd "Contrast Learning"
 conda env create -f environment.yaml
 conda activate contrast-learning
 # или: conda activate new_chemberta_env
 ```
 
-### Вариант B — pip
+
+
+### Boltz-2 (отдельное окружение)
 
 ```bash
-cd "C:\Users\USER\Contrast Learning"
-python -m venv .venv
-.venv\Scripts\activate        # Windows
-pip install -r requirements.txt
+conda activate boltz
+# CLI: boltz predict ...
 ```
 
-### HuggingFace-модели (скачаются при первом запуске)
+
+
+### HuggingFace (при первом запуске)
 
 - Аптамеры: `AIRI-Institute/gena-lm-bert-base`
 - Молекулы: `seyonec/ChemBERTa-zinc-base-v1`
 
-Нужен интернет и ~2–4 GB на диске для кэша моделей.
-
 ---
+
+
 
 ## Быстрый старт
 
-### 1. Подготовить эмбеддинги (если ещё нет v2 CSV)
+
+
+### 1. Эмбеддинги
 
 ```bash
 python Embeddings.py
 ```
 
-### 2a. Генерация (default — test split, top-10 молекул)
+
+
+### 2a. Генерация (default — test split)
 
 ```bash
 python "Contrast Learning.py"
@@ -116,9 +234,7 @@ python "Contrast Learning.py"
 
 Выход: `generation_summary.csv`, `top_candidates_for_tools.csv`, `generated_pairs_molecule_aptamer.txt`.
 
-> **Внимание:** молекулы из test split часто крупные (аминогликозиды, ~50 heavy atoms) — **вне зоны калибровки RSAPred**. Для проверки в RSAPred используйте п. 2b.
-
-### 2b. Генерация для RSAPred (малые молекулы с pKd)
+### 2b. Генерация для RSAPred (рекомендуется для валидации)
 
 ```bash
 python run_rsapred_generation.py --max-targets 20 --max-heavy-atoms 40
@@ -128,22 +244,18 @@ python run_rsapred_generation.py --max-targets 20 --max-heavy-atoms 40
 
 Приоритетные мишени: caffeine, xanthine, 2-aminopyrimidine.
 
-### 3. Rerank
-
-**RSAPred-прогон (рекомендуется перед внешней валидацией):**
+### 3. Переранжирование
 
 ```bash
+# RSAPred-прогон
 python rerank_generated_aptamers.py ^
   --use-summary ^
   --summary rsapred_generation_summary.csv ^
   --all-molecules ^
   --output rsapred_rerank_all.csv ^
   --max-motif-penalty 0.05
-```
 
-**Default-прогон:**
-
-```bash
+# Default-прогон
 python rerank_generated_aptamers.py ^
   --use-summary ^
   --summary generation_summary.csv ^
@@ -152,44 +264,98 @@ python rerank_generated_aptamers.py ^
   --max-motif-penalty 0.05
 ```
 
-**Экспорт diverse-пар для RSAPred:**
+Экспорт diverse-пар без шаблонов:
 
 ```bash
 python export_rsapred_diverse_pairs.py
 ```
 
-Создаёт `rsapred_pairs_to_submit.csv` (19 пар с `motif_penalty=0`).
 
-### 4. Boltz-2 batch (опционально)
+
+### 4. RSAPred (автоматизация или вручную)
+
+**Автоматически** — Microsoft Edge (Selenium Manager) или HTTP без браузера:
+
+```bash
+pip install -r requirements-rsapred-automation.txt
+
+# Edge с окном (по умолчанию; стабильно на RSAPred)
+python rsapred_selenium_batch.py --input rsapred_pairs_to_submit.csv
+
+# Headless (может не загрузить форму)
+python rsapred_selenium_batch.py --headless
+
+# Явный путь к msedgedriver (если версия совпадает с Edge)
+python rsapred_selenium_batch.py --driver C:\path\to\msedgedriver.exe
+
+# HTTP POST (тот же формуляр, без браузера)
+python rsapred_selenium_batch.py --backend requests --input rsapred_pairs_to_submit.csv
+```
+
+Результаты: `rsapred_automation_results.csv` (resume при повторном запуске).  
+Порог: **pKd < 4.5** → negative-like (`rsapred_pass=True`).
+
+**Вручную** на сайте — те же пары из `rsapred_pairs_to_submit.csv` (колонки `rna_sequence`, `smiles`).
+
+### 5. Boltz-2
+
+```bash
+conda activate boltz
+python boltz_script.py aptabench ^
+  --from-selected-pairs boltz_rsapred_top10_pairs.csv ^
+  --timeout 3600
+```
+
+Dry-run (только YAML-конфиги):
+
+```bash
+python boltz_script.py aptabench --from-selected-pairs boltz_rsapred_top10_pairs.csv --dry-run
+```
+
+Калибровка на AptaBench:
 
 ```bash
 python boltz_script.py aptabench --data aptabench_with_embeddings_v2.csv --n-positive 100 --n-negative 100
 ```
 
+
+
+### 6. Vina / SimRNA (Colab)
+
+См. `докинг_fixed.ipynb`. Coarse-grained RNA (~95 атомов) — **вспомогательная** метрика.
+
 ---
 
-## Настройки в `Contrast Learning.py`
+
+
+## Настройки (`Contrast Learning.py`)
 
 ```python
 DATA_FILE = "aptabench_with_embeddings_v2.csv"
 MODEL_CHECKPOINT = "final_micro_model.pth"
-USE_PRETRAINED = False   # False = переобучить; True = загрузить готовые веса
+USE_PRETRAINED = False   # True = загрузить готовые веса без retrain
 ```
 
-### GEN_CONFIG (ключевые параметры)
 
-| Параметр | Значение | Смысл |
-|----------|----------|-------|
-| `target_smiles` | `None` | Подстрока SMILES или `None` = test split |
-| `max_generation_targets` | `10` | Top-N молекул по `contrastive_separation` |
-| `min_contrastive_separation` | `0.05` | Минимальный зазор pos/neg для мишени |
-| `max_latent_sim_for_decode` | `-0.10` | Порог cosine(mol_z, decoded_seq) при отборе |
-| `sequence_sim_filter` | `True` | Фильтр `decoded_sim < positive_mean` |
-| `motif_penalty_weight` | `0.15` | Штраф за шаблоны CTTACGAC/GGGACGAC |
-| `max_motif_penalty_for_tools` | `0.05` | Макс. motif для top-K в tools CSV |
-| `n_keep` | `50` | Сколько аптамеров сохранить на молекулу |
 
-Пример — только caffeine:
+### GEN_CONFIG
+
+
+| Параметр                      | Значение | Смысл                                     |
+| ----------------------------- | -------- | ----------------------------------------- |
+| `target_smiles`               | `None`   | Подстрока SMILES или test split           |
+| `max_generation_targets`      | `10`     | Top-N по `contrastive_separation`         |
+| `min_contrastive_separation`  | `0.05`   | Мин. зазор pos/neg для мишени             |
+| `max_latent_sim_for_decode`   | `-0.10`  | Порог cosine(mol_z, decoded_seq)          |
+| `sequence_sim_filter`         | `True`   | `decoded_sim < positive_mean`             |
+| `motif_penalty_weight`        | `0.15`   | Штраф за шаблоны CTTACGAC / GGGACGAC      |
+| `max_motif_penalty_for_tools` | `0.05`   | Макс. штраф за мотив в top-K для tools    |
+| `reject_high_motif_repeat`    | `True`   | Отсекать сильные повторы мотива           |
+| `max_same_prefix`             | `2`      | Лимит одинаковых префиксов (разнообразие) |
+| `n_keep`                      | `50`     | Аптамеров на молекулу                     |
+
+
+Пример одной мишени (caffeine):
 
 ```python
 "target_smiles": "Cn1c(=O)c2[nH]cnc2n(C)c1=O",
@@ -197,99 +363,157 @@ USE_PRETRAINED = False   # False = переобучить; True = загрузи
 
 ---
 
+
+
 ## Интерпретация метрик
 
-Метрики ниже относятся к **переобученной** модели (`USE_PRETRAINED=False`). После contrastive + GRU в latent-пространстве cosine для negatives становится **отрицательным** — это нормально и ожидаемо.
 
-### На этапе генерации (`generation_summary.csv`)
 
-| Метрика | Хорошо | Плохо | Смысл |
-|---------|--------|-------|-------|
-| `seed_sim` | < 0 | > 0.15 | Cosine(mol_z, negative latent seed) |
-| `decoded_sim` | < −0.15 | > 0 | Cosine(mol_z, эмбеддинг сгенерированной последовательности) |
-| `motif_penalty` | **0.00** | **0.12** | Штраф за префиксы `CTTACGAC` / `GGGACGAC` |
-| `contrastive_separation` | ≥ 0.05 | < 0.05 | Зазор pos/neg mean для мишени в датасете |
+### Генерация (`generation_summary.csv`)
 
-Типичный RSAPred-прогон: mean `decoded_sim` ≈ **−0.18**; ~5% пар без шаблонов (`motif=0`).
 
-### На этапе rerank (`rerank_*.csv`)
+| Метрика                  | Хорошо   | Плохо    | Смысл                                                  |
+| ------------------------ | -------- | -------- | ------------------------------------------------------ |
+| `seed_sim`               | < 0      | > 0.15   | Cosine(mol_z, negative seed)                           |
+| `decoded_sim`            | < −0.15  | > 0      | Cosine(mol_z, aptamer после GRU)                       |
+| `motif_penalty`          | **0.00** | **0.12** | Шаблоны CTTACGAC / GGGACGAC (штрафуются при генерации) |
+| `contrastive_separation` | ≥ 0.05   | < 0.05   | Зазор pos/neg mean                                     |
 
-| Метрика | Фильтр | Смысл |
-|---------|--------|-------|
-| `sequence_sim` | ≤ 0.15 (absolute) | Cosine(mol_z, aptamer_emb) после декодирования |
-| `passes_relative_filter` | `sequence_sim < baseline_positive_mean` | Относительный фильтр к позитивам мишени |
-| `motif_penalty` | ≤ 0.05 для diverse | Без доминирующих шаблонов |
-| `rank_diverse` | 1 = лучший diverse | Ранг среди кандидатов с `motif ≤ 0.05` |
-| `composite_score` | min лучше | `sequence_sim + 0.15 × motif_penalty` |
 
-> **Устаревшее:** диапазон `sequence_sim` 0.83–0.96 для negatives относился к **сырым** ChemBERTa/GENA эмбеддингам без contrastive-проекции. В текущем пайплайне `sequence_sim` и `decoded_sim` **отрицательные** (−0.10 … −0.22).
+В генерации уже включены штраф за мотив, отсечение повторов (`reject_high_motif_repeat`) и отбор по разнообразию (`select_diverse_output_candidates` / `max_same_prefix`). Типичный RSAPred-прогон: mean `decoded_sim` ≈ **−0.18**; в топе для tools обычно `motif_penalty ≤ 0.05`.
 
-### RSAPred pKd (основная внешняя метрика)
+> **Устарело:** `sequence_sim` 0.83–0.96 — для **сырых** эмбеддингов без контрастива. Сейчас значения **отрицательные**.
 
-| Класс (AptaBench v2) | mean pKd |
-|----------------------|----------|
-| positive (binding) | ~6.24 |
-| negative (non-binding) | ~3.34 |
 
-**Рабочий порог:** pKd **< 4.5** → negative-like (millimolar, слабое/нет связывания).
 
-RSAPred калиброван на **малых молекулах** (median ~32 heavy atoms в RSAPred-парах). Крупные аминогликозиды из test split — **out-of-domain**; для них RSAPred даёт завышенный pKd (~5.0).
+### Rerank (`rerank_*.csv`)
+
+
+| Метрика                  | Фильтр                                           |
+| ------------------------ | ------------------------------------------------ |
+| `sequence_sim`           | ≤ 0.15 (absolute)                                |
+| `passes_relative_filter` | < `baseline_positive_mean`                       |
+| `motif_penalty`          | ≤ 0.05 для diverse                               |
+| `rank_diverse`           | 1 = лучший без шаблона                           |
+| `composite_score`        | `sequence_sim + 0.15 × motif_penalty`, min лучше |
+
+
+
+
+### RSAPred pKd
+
+
+| Класс    | mean pKd |
+| -------- | -------- |
+| positive | ~6.24    |
+| negative | ~3.34    |
+
+
+**Порог:** pKd **< 4.5** → negative-like (mM).
 
 ### Boltz `affinity_pred_value`
 
-log₁₀(IC50, µM). **Выше = слабее связывание.** +2 ≈ слабый/декой.
+log₁₀(IC50, µM). **Выше = слабее связывание.**
+
+- Ensemble **> +2** → слабое (эвристика из caffeine-калибровки)
+- Скрипт также берёт **best run** (подмодель с max `affinity_probability_binary`)
+- На AptaBench pos/neg ensemble **плохо разделяются** (~−1.5 vs −1.9) — смотрите оба значения
+
+
 
 ### Vina (kcal/mol)
 
-Для калибровки на caffeine: positives ~−8.5, negatives ~−5.6. SimRNA+Vina в Colab **не пригоден как основная метрика** (coarse-grained PDB).
+**Более отрицательное = сильнее связывание** (знак противоположен Boltz).
+
+
+| Класс             | типично |
+| ----------------- | ------- |
+| RSAPred positives | ~−8.5   |
+| RSAPred negatives | ~−5.6   |
+
+
+Цель для non-binding: **−5 … −6**, не ниже **−7**.
+
+### Decision tree (триангуляция)
+
+```text
+decoded_sim < positive_mean?  → contrastive PASS
+    ↓
+RSAPred pKd < 4.5?            → external negative-like
+    ↓
+Boltz best > −3?              → good_negative (скрипт)
+Boltz ensemble > +2?          → weak (доп. эвристика)
+    ↓
+Vina ≈ −5.5 … −6?             → согласуется с RSAPred negatives
+```
+
+**Gold candidate:** ≥2 из 3 внешних валидаторов в negative-зоне.
 
 ---
 
-## RSAPred валидация
 
-Проверены **все 19 diverse-пар** из `rsapred_rerank_all.csv` (`motif_penalty=0`, без шаблонов GGGACGAC/CTTACGAC). Полная таблица: `rsapred_validation_results.csv`.
 
-### Сводка
+## Результаты валидации
 
-| Метрика | Значение |
-|---------|----------|
-| PASS (pKd < 4.5) | **13 / 19 (68%)** |
-| FAIL (pKd ≥ 4.5) | 6 / 19 (32%) |
-| Лучший результат | mol7_diverse_3 → **pKd 2.8** |
-| Худший результат | mol10_diverse_1 → **pKd 6.37** (µM, предсказанное связывание) |
-| Средний pKd (PASS) | ~3.7 |
-| Средний pKd (FAIL) | ~5.2 |
 
-### Лучшие пары (для демо / публикации)
 
-| pair_id | SMILES | pKd |
-|---------|--------|-----|
-| mol7_diverse_3 | `Nc1ncc2[nH]cnc2n1` | **2.8** |
-| mol7_diverse_1 | `Nc1ncc2[nH]cnc2n1` | **3.1** |
-| mol7_diverse_2 | `Nc1ncc2[nH]cnc2n1` | **3.13** |
+### RSAPred — 19 diverse-пар (`rsapred_validation_results.csv`)
 
-Молекула mol7: **3/3** diverse-кандидата прошли RSAPred.
 
-### Провальные мишени
+| Метрика          | Значение                              |
+| ---------------- | ------------------------------------- |
+| PASS (pKd < 4.5) | **13 / 19 (68%)**                     |
+| Лучший           | mol7_diverse_3 → **pKd 2.8**          |
+| Худший           | mol10_diverse_1 → **pKd 6.37** (µM)   |
+| Лучшая мишень    | mol7 (`Nc1ncc2[nH]cnc2n1`) — 3/3 PASS |
+| Слабые мишени    | mol4, mol10 — 0% PASS                 |
 
-| Молекула | PASS/total | Комментарий |
-|----------|------------|-------------|
-| mol10 `Cc1ccc(NCCN)nc1` | 0/2 | Оба аптамера — binding (5.01 и 6.37 µM) |
-| mol4 `NCCNc1ccccn1` | 0/2 | pKd 4.92 и 5.48 |
-| mol8, mol11 | 0/1 | Borderline (4.67, 4.78) |
 
-### Универсальная последовательность `CCUUACGACACAUUUGGG...`
 
-Одна RNA на 6 молекулах: **5 PASS** (pKd 3.55–4.12), **1 FAIL** (mol10, pKd 5.01). Провал связан с мишенью, а не с последовательностью.
 
-### Оговорки
+### Boltz — top-10 (5/10 завершено, `run_20260615_022557`)
 
-- 68% — на **отфильтрованных** diverse-кандидатах, не на случайной выборке.
-- Молекулы 9–13 heavy atoms (in-domain для RSAPred).
-- Порог 4.5 — эвристика; официального cutoff у RSAPred нет.
-- `sequence_sim` из rerank **слабо коррелирует** с RSAPred pKd (mol8: лучший sim, FAIL; mol7: хуже sim, PASS).
+
+| pair_id        | RSAPred | ensemble  | best run |
+| -------------- | ------- | --------- | -------- |
+| mol7_diverse_3 | 2.8     | −0.27     | −2.09    |
+| mol7_diverse_1 | 3.1     | +0.26     | −1.85    |
+| mol7_diverse_2 | 3.13    | −0.26     | −2.15    |
+| mol1_diverse_1 | 3.55    | −1.62     | −2.09    |
+| mol9_diverse_2 | 3.74    | **+2.67** | −2.26    |
+
+
+Best run (~−2.0) близок к AptaBench negatives (mean −1.7). Ensemble нестабилен (1/5 > +2).
+
+### Vina — 5 пар (Colab)
+
+
+| pair_id         | RSAPred | Vina best | PASS (−5…−6) |
+| --------------- | ------- | --------- | ------------ |
+| mol7_diverse_1  | 3.1     | **−5.58** | ✓            |
+| mol7_diverse_2  | 3.13    | −5.86     | ✓            |
+| mol1_diverse_1  | 3.55    | −5.83     | ✓            |
+| mol18_diverse_1 | 3.76    | −5.78     | ✓            |
+| mol9_diverse_2  | 3.74    | −6.65     | ⚠ (сильнее)  |
+
+
+
+
+### Gold candidate (полная триангуляция)
+
+**mol7_diverse_1** — `Nc1ncc2[nH]cnc2n1` + `CCUUACGACAAUGGGGCAGUUUUAUGAUGUGGGUGGUGUGUCGUAAG`
+
+
+| Метрика     | Значение           |
+| ----------- | ------------------ |
+| RSAPred pKd | **3.1**            |
+| Boltz best  | **−1.85**          |
+| Vina        | **−5.58 kcal/mol** |
+
 
 ---
+
+
 
 ## Переобучение с нуля
 
@@ -297,46 +521,49 @@ log₁₀(IC50, µM). **Выше = слабее связывание.** +2 ≈ �
 USE_PRETRAINED = False
 ```
 
-Опционально удалите перед запуском: `final_micro_model.pth`, `best_conditional_decoder.pth`, `cluster_*.npy`.
+Опционально удалите: `final_micro_model.pth`, `best_conditional_decoder.pth`, `cluster_*.npy`.
 
-Запуск займёт значительно больше времени (contrastive 15 эпох + GRU).
+После retrain запустите:
+
+```bash
+python diagnose_contrastive_training.py
+```
 
 ---
+
+
 
 ## Требования к данным
 
-CSV должен содержать:
-
-- `sequence` (или колонка с `sequence` в имени)
-- `canonical_smiles` (или колонка со `smiles` в имени)
-- `label` — `1` = interacting, `0` = non-interacting
-- `seq_emb_*` — эмбеддинги аптамеров (768 колонок)
-- `smi_emb_*` — эмбеддинги молекул (768 колонок)
-
-Для RSAPred-прогона дополнительно: `source`, `pKd_value`.
+- `sequence`, `canonical_smiles`, `label` (0/1)
+- `seq_emb_*`, `smi_emb_*` (768d)
+- Для RSAPred-прогона: `source`, `pKd_value`
 
 ---
+
+
 
 ## Известные ограничения
 
-1. GRU склонен к mode collapse на шаблоны `CTTACGAC` / `GGGACGAC` (`motif_penalty=0.12`) — используйте rerank с `--max-motif-penalty 0.05`.
-2. Contrastive `sequence_sim` не предсказывает RSAPred pKd надёжно — нужна внешняя валидация.
-3. Некоторые мишени (аминопиридины mol4, mol10) устойчиво дают FAIL в RSAPred.
-4. Default test split (крупные молекулы) не подходит для RSAPred — используйте `run_rsapred_generation.py`.
-5. Boltz, RSAPred, Vina запускаются отдельно от основного скрипта.
+1. **Схлопывание мотивов (раньше):** сырой GRU часто выдавал шаблоны GGGACGAC/CTTACGAC (`motif≈0.12`). Сейчас это **смягчено** штрафом за мотив, запретом повторов и отбором по разнообразию уже на этапе генерации; при переранжировании `--max-motif-penalty 0.05` — дополнительная страховка, а не обязательный «костыль».
+2. `sequence_sim` **слабо предсказывает RSAPred** — нужна внешняя проверка.
+3. **mol4, mol10** — устойчивые FAIL; нужен отдельный прогон по этим мишеням.
+4. **Обычное тестовое разбиение** — не для RSAPred (крупные молекулы).
+5. **Boltz / Vina / RSAPred** — отдельные окружения и ручные шаги.
 
 ---
+
+
 
 ## Полезные команды
 
 ```bash
-# Диагностика contrastive-обучения
 python diagnose_contrastive_training.py
-
-# Диагностика эмбеддингов последовательностей
 python diagnose_seq_embedding_pipeline.py --help
-
-# Превью RSAPred-мишеней
 python preview_rsapred_targets.py
+python analyze_nonbinding_proximity.py
+python analyze_rsapred_molecule_sizes.py
 ```
+
+---
 
