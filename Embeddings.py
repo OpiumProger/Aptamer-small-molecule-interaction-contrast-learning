@@ -14,6 +14,82 @@ import numpy as np
 from transformers import AutoTokenizer, AutoModelForMaskedLM, AutoModel,T5EncoderModel
 from tqdm import tqdm
 
+GENA_MODEL_ID = os.environ.get("GENA_MODEL_NAME", "AIRI-Institute/gena-lm-bert-base")
+CHEMBERTA_MODEL_ID = os.environ.get("CHEMBERTA_MODEL_NAME", "seyonec/ChemBERTa-zinc-base-v1")
+
+_ENCODER_CACHE = {}
+
+
+def _load_hf_model(model_cls, model_id, **kwargs):
+    """Load HF model; prefer local cache when offline or network fails."""
+    local_only = os.environ.get("HF_HUB_OFFLINE", "0") == "1"
+    try:
+        return model_cls.from_pretrained(model_id, local_files_only=local_only, **kwargs)
+    except Exception as first_error:
+        if local_only:
+            raise
+        try:
+            print(f"[WARN] Online load failed for {model_id}; retrying from local cache...")
+            return model_cls.from_pretrained(model_id, local_files_only=True, **kwargs)
+        except Exception:
+            raise first_error
+
+
+def _load_hf_tokenizer(model_id):
+    local_only = os.environ.get("HF_HUB_OFFLINE", "0") == "1"
+    try:
+        return AutoTokenizer.from_pretrained(model_id, local_files_only=local_only)
+    except Exception as first_error:
+        if local_only:
+            raise
+        try:
+            print(f"[WARN] Online tokenizer load failed for {model_id}; retrying from local cache...")
+            return AutoTokenizer.from_pretrained(model_id, local_files_only=True)
+        except Exception:
+            raise first_error
+
+
+def _get_aptamer_encoder(encoder_type="auto_model", device=None):
+    device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    cache_key = ("aptamer", encoder_type, str(device))
+    if cache_key in _ENCODER_CACHE:
+        return _ENCODER_CACHE[cache_key]
+
+    tokenizer = _load_hf_tokenizer(GENA_MODEL_ID)
+    if encoder_type == "masked_lm":
+        model_cls = AutoModelForMaskedLM
+    elif encoder_type == "auto_model":
+        model_cls = AutoModel
+    else:
+        raise ValueError("encoder_type должен быть 'auto_model' или 'masked_lm'")
+
+    model = _load_hf_model(
+        model_cls,
+        GENA_MODEL_ID,
+        trust_remote_code=True,
+        output_hidden_states=True,
+    )
+    model.to(device)
+    model.eval()
+    _ENCODER_CACHE[cache_key] = (tokenizer, model, device)
+    print(f"GENA-LM encoder loaded once and cached ({GENA_MODEL_ID}, device={device})")
+    return _ENCODER_CACHE[cache_key]
+
+
+def _get_smiles_encoder(device=None):
+    device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    cache_key = ("smiles", str(device))
+    if cache_key in _ENCODER_CACHE:
+        return _ENCODER_CACHE[cache_key]
+
+    tokenizer = _load_hf_tokenizer(CHEMBERTA_MODEL_ID)
+    model = _load_hf_model(AutoModel, CHEMBERTA_MODEL_ID)
+    model.to(device)
+    model.eval()
+    _ENCODER_CACHE[cache_key] = (tokenizer, model, device)
+    print(f"ChemBERTa encoder loaded once and cached ({CHEMBERTA_MODEL_ID}, device={device})")
+    return _ENCODER_CACHE[cache_key]
+
 def data_prepare(data, sequence_column='sequence', smiles_column='canonical_smiles'):
     df = pd.read_csv(data)
 
@@ -81,29 +157,16 @@ def aptamer_encode(
     batch_size=16,
     device=None,
 ):
-    tokenizer = AutoTokenizer.from_pretrained('AIRI-Institute/gena-lm-bert-base')
-    if encoder_type == 'masked_lm':
-        model_cls = AutoModelForMaskedLM
-    elif encoder_type == 'auto_model':
-        model_cls = AutoModel
-    else:
-        raise ValueError("encoder_type должен быть 'auto_model' или 'masked_lm'")
-
-    model = model_cls.from_pretrained(
-        'AIRI-Institute/gena-lm-bert-base',
-        trust_remote_code=True,
-        output_hidden_states=True,
-    )
-    device = torch.device(device or ('cuda' if torch.cuda.is_available() else 'cpu'))
-    model.to(device)
-    model.eval()
+    tokenizer, model, device = _get_aptamer_encoder(encoder_type=encoder_type, device=device)
 
     all_embeddings = []
 
-    print(
-        "Начинаем кодирование аптамеров "
-        f"(GENA-LM {encoder_type}, pooling={pooling}, max_length={max_length}, device={device})..."
-    )
+    if not hasattr(aptamer_encode, "_logged_start"):
+        print(
+            "Начинаем кодирование аптамеров "
+            f"(GENA-LM {encoder_type}, pooling={pooling}, max_length={max_length}, device={device})..."
+        )
+        aptamer_encode._logged_start = True
     for i in tqdm(range(0, len(clean_sequences), batch_size), desc="Обработка батчей"):
         batch = clean_sequences[i:i + batch_size]
 
@@ -158,11 +221,7 @@ def aptamer_encode(
 
 
 def smiles_encode(clean_smiles, device=None):
-    tokenizer = AutoTokenizer.from_pretrained("seyonec/ChemBERTa-zinc-base-v1")
-    model = AutoModel.from_pretrained("seyonec/ChemBERTa-zinc-base-v1")
-    device = torch.device(device or ('cuda' if torch.cuda.is_available() else 'cpu'))
-    model.to(device)
-    model.eval()
+    tokenizer, model, device = _get_smiles_encoder(device=device)
 
     print(f"\nНачинаем кодирование SMILES (ChemBERTa, device={device})...")
     batch_size = 32
