@@ -15,7 +15,7 @@ class MicroContrastiveModel(nn.Module):
             nn.LayerNorm(latent_dim),
             nn.GELU(),
             nn.Dropout(dropout),
-  
+
             nn.Linear(latent_dim, latent_dim),
             nn.LayerNorm(latent_dim),
             nn.GELU(),
@@ -28,7 +28,7 @@ class MicroContrastiveModel(nn.Module):
             nn.LayerNorm(latent_dim),
             nn.GELU(),
             nn.Dropout(dropout),
-            
+
             nn.Linear(latent_dim, latent_dim),
             nn.LayerNorm(latent_dim),
             nn.GELU(),
