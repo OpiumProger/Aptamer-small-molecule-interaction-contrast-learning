@@ -30,11 +30,19 @@ def _batch_separation_metrics(z_anchor, z_positive, z_negatives):
 
 class FinalTrainer:
 
-    def __init__(self, model, train_loader, val_loader, device='cuda'):
+    def __init__(
+        self,
+        model,
+        train_loader,
+        val_loader,
+        device='cuda',
+        tracker=None,
+    ):
         self.model = model.to(device)
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.device = device
+        self.tracker = tracker
 
         # Loss function
 
@@ -72,6 +80,27 @@ class FinalTrainer:
         self.patience = 5
         self.best_model_state = None
         self.best_epoch = 0
+
+        if self.tracker is not None:
+            self.tracker.log_params(
+                {
+                    'optimizer': 'AdamW',
+                    'model_lr': 4e-4,
+                    'temperature_lr': 1e-2,
+                    'weight_decay': 5e-3,
+                    'scheduler': 'StepLR',
+                    'scheduler_step_size': 5,
+                    'scheduler_gamma': 0.5,
+                    'init_temperature': 0.25,
+                    'margin': 0.15,
+                    'margin_weight': 0.5,
+                    'l2_weight': 0.01,
+                    'gradient_clip': 0.25,
+                    'early_stopping_patience': self.patience,
+                    'overlap_penalty': self.overlap_penalty,
+                },
+                prefix='contrastive',
+            )
 
     def compute_l2_reg(self):
         l2_reg = 0
@@ -226,6 +255,28 @@ class FinalTrainer:
             self.history['temperature'].append(current_temp)
             self.history['train_val_gap'].append(gap)
 
+            if self.tracker is not None:
+                self.tracker.log_metrics(
+                    {
+                        'train_loss': train_loss,
+                        'val_loss': val_loss,
+                        'train_accuracy': train_acc,
+                        'val_accuracy': val_acc,
+                        'train_top3': train_top3,
+                        'val_top3': val_top3,
+                        'train_separation': train_sep,
+                        'val_separation': val_sep,
+                        'train_overlap_pct': train_overlap,
+                        'val_overlap_pct': val_overlap,
+                        'val_score': val_score,
+                        'temperature': current_temp,
+                        'train_val_gap': gap,
+                        'learning_rate': self.optimizer.param_groups[0]['lr'],
+                    },
+                    step=epoch,
+                    prefix='contrastive',
+                )
+
             print(f"\n  Epoch {epoch:03d}/{n_epochs}")
             print(f"  Train Loss: {train_loss:.6f} | Acc: {train_acc:.3f} | Sep: {train_sep:.3f} | Overlap: {train_overlap:.1%}")
             print(f"  Val   Loss: {val_loss:.6f} | Acc: {val_acc:.3f} | Sep: {val_sep:.3f} | Overlap: {val_overlap:.1%}")
@@ -286,5 +337,17 @@ class FinalTrainer:
         print(f"   Best validation separation: {self.best_val_separation:.3f}")
         print(f"   Best validation accuracy: {self.best_val_acc:.3f}")
         print(f"   Final train-val gap: {self.history['train_val_gap'][-1]:.3f}")
+
+        if self.tracker is not None:
+            self.tracker.log_metrics(
+                {
+                    'best_epoch': self.best_epoch,
+                    'best_val_score': self.best_val_score,
+                    'best_val_separation': self.best_val_separation,
+                    'best_val_accuracy': self.best_val_acc,
+                },
+                prefix='contrastive',
+            )
+            self.tracker.log_artifact(save_path, artifact_path='models/contrastive')
 
         return self.history
